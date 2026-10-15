@@ -2,6 +2,8 @@
 
 ## 1.0.0 — 2026-10-15
 
+- Resolve full-main Sonar findings: document rotation error responses, simplify proxy handlers and conditionals, remove redundant exceptions, and make test assertions independent.
+
 - Keep active CONNECT uploads/responses alive while either direction is active.
 - Remember the last successful SSH server across restarts; add `state_file` and `server_name`, CLI startup overrides, and standalone configuration discovery.
 - Add `init-config` with a packaged mode-0600 example and no-overwrite behavior.

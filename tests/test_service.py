@@ -50,7 +50,8 @@ async def test_rotation_stops_old_and_changes_id(manager):
     second = await manager.rotate()
     assert process.terminated
     assert first["connection_id"] != second["connection_id"]
-    assert first["server"] == "one" and second["server"] == "two"
+    assert first["server"] == "one"
+    assert second["server"] == "two"
     assert second["started_at"].endswith("+00:00")
     manager.process.returncode = 255
     assert manager.status()["connection_id"] is None
@@ -110,7 +111,8 @@ async def test_authenticated_api_and_busy_response(manager):
         assert (await client.post("/rotate", headers=headers)).status_code == 200
         manager._busy = True
         response = await client.post("/rotate", headers=headers)
-        assert response.status_code == 429 and response.headers["Retry-After"] == "1"
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "1"
         manager._busy = False
         assert (await client.get("/status", headers=headers)).json()["connection_id"]
     await manager.close()
@@ -152,7 +154,9 @@ def test_main_failure_prints_help(monkeypatch, capsys):
         main()
     assert exc.value.code == 1
     text = capsys.readouterr().err
-    assert "Error:" in text and "Usage:" in text and "--help" in text
+    assert "Error:" in text
+    assert "Usage:" in text
+    assert "--help" in text
 
 
 def test_ipv6_command_uses_safe_args():
@@ -216,9 +220,11 @@ def test_startup_generates_persists_and_prints_token(tmp_path, monkeypatch, caps
     monkeypatch.setattr("tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: run.append(kwargs))
     serve(path)
     saved = load_config(path).api.token
-    assert saved and len(saved) >= 40
+    assert saved
+    assert len(saved) >= 40
     assert f"API token: {saved}" in capsys.readouterr().out
-    assert "# Keep this comment" in path.read_text() and "# API port" in path.read_text()
+    assert "# Keep this comment" in path.read_text()
+    assert "# API port" in path.read_text()
     assert path.stat().st_mode & 0o777 == 0o600
     assert settings(path)[1] == saved
     assert run[0]["port"] == 8765
@@ -266,9 +272,13 @@ def test_host_only_server_loads_and_omits_ssh_overrides(tmp_path):
     cfg = load_config(path)
     server = cfg.servers[0]
     assert server.name == "my-ssh-alias"
-    assert server.user is None and server.port is None and server.identity_file is None
+    assert server.user is None
+    assert server.port is None
+    assert server.identity_file is None
     command = TunnelManager(cfg).command(server)
-    assert "-l" not in command and "-p" not in command and "-i" not in command
+    assert "-l" not in command
+    assert "-p" not in command
+    assert "-i" not in command
     assert "-F" not in command
     assert command[-2:] == ["--", "my-ssh-alias"]
 

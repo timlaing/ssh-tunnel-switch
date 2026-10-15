@@ -117,10 +117,12 @@ async def test_http_get_rewrites_target_and_strips_proxy_credentials(network):
         response = await asyncio.wait_for(reader.read(), 2)
         writer.close()
         await writer.wait_closed()
-        assert response.endswith(b"hello") and b"200" in response
+        assert response.endswith(b"hello")
+        assert b"200" in response
         assert requests[0].startswith(b"GET /path?q=yes HTTP/1.1\r\n")
         assert f"Host: example.test:{origin_port}".encode().lower() in requests[0].lower()
-        assert b"private" not in requests[0] and b"wrong.example" not in requests[0]
+        assert b"private" not in requests[0]
+        assert b"wrong.example" not in requests[0]
         assert destinations == [("example.test", origin_port)]
 
 
@@ -129,7 +131,8 @@ async def test_http_streaming_chunked_post_and_response(network):
     async def origin(reader, writer):
         received.append(await reader.readuntil(b"\r\n\r\n"))
         body = await reader.readuntil(b"0\r\n\r\n")
-        assert b"first" in body and b"second" in body
+        assert b"first" in body
+        assert b"second" in body
         writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
         await writer.drain()
     origin_port = await network(origin)
@@ -140,7 +143,8 @@ async def test_http_streaming_chunked_post_and_response(network):
     async with bridge(network) as (port, _, _):
         async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}", trust_env=False) as client:
             response = await client.post(f"http://127.0.0.1:{origin_port}/upload", content=chunks())
-            assert response.status_code == 200 and response.text == "hello"
+            assert response.status_code == 200
+            assert response.text == "hello"
     assert b"transfer-encoding: chunked" in received[0].lower()
 
 
@@ -187,7 +191,8 @@ async def test_connect_transports_real_tls(network, tmp_path, streamed):
     async with bridge(network, idle_timeout_seconds=0.2 if streamed else 120) as (port, destinations, _):
         async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}", verify=trusted, trust_env=False) as client:
             response = await client.get(f"https://localhost:{origin_port}/secure")
-            assert response.text == "secure" and response.status_code == 200
+            assert response.text == "secure"
+            assert response.status_code == 200
         assert destinations == [("localhost", origin_port)]
 
 

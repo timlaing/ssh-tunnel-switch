@@ -37,8 +37,11 @@ class TunnelManager:
 
     def status(self) -> dict:
         alive = self.process is not None and self.process.returncode is None
+        state = "connected" if alive else "disconnected"
+        if self._busy:
+            state = "rotating"
         return {
-            "state": "rotating" if self._busy else "connected" if alive else "disconnected",
+            "state": state,
             "connection_id": self.connection_id if alive else None,
             "started_at": self.started_at.isoformat() if alive and self.started_at else None,
             "server": self.server_name if alive else None,
@@ -95,7 +98,7 @@ class TunnelManager:
             writer.write(b"\x05\x01\x00")
             await writer.drain()
             return await asyncio.wait_for(reader.readexactly(2), 0.5) == b"\x05\x00"
-        except (OSError, TimeoutError, asyncio.IncompleteReadError):
+        except (OSError, asyncio.IncompleteReadError):
             return False
         finally:
             if writer:

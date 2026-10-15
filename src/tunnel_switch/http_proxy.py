@@ -72,7 +72,10 @@ class HTTPProxyServer:
 
     async def _socks(self, host: str, port: int):
         proxy_ip = str(self.config.proxy.ip)
-        proxy_ip = "127.0.0.1" if proxy_ip == "0.0.0.0" else "::1" if proxy_ip == "::" else proxy_ip
+        if proxy_ip == "0.0.0.0":
+            proxy_ip = "127.0.0.1"
+        elif proxy_ip == "::":
+            proxy_ip = "::1"
         reader, writer = await asyncio.open_connection(proxy_ip, self.config.proxy.port)
         try:
             writer.write(b"\x05\x01\x00")
@@ -157,6 +160,32 @@ class HTTPProxyServer:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _send_body(self, inbound, reader, outbound, upstream_writer):
+        while True:
+            event = await self._read_event(inbound, reader)
+            if not isinstance(event, (h11.Data, h11.EndOfMessage)):
+                raise ProxyError("Incomplete HTTP request body")
+            upstream_writer.write(outbound.send(event))
+            await upstream_writer.drain()
+            if isinstance(event, h11.EndOfMessage):
+                return
+
+    async def _receive_response(self, outbound, upstream_reader, inbound, writer):
+        while True:
+            event = await self._read_event(outbound, upstream_reader)
+            if isinstance(event, (h11.Response, h11.InformationalResponse)):
+                if event.status_code == 101:
+                    raise ProxyError("HTTP Upgrade is unsupported; use CONNECT")
+                event = type(event)(status_code=event.status_code, reason=event.reason,
+                                   headers=headers_for_forwarding(event.headers))
+            elif not isinstance(event, (h11.Data, h11.EndOfMessage)):
+                raise ProxyError("Incomplete upstream response")
+            writer.write(inbound.send(event))
+            await writer.drain()
+            if isinstance(event, h11.EndOfMessage):
+                return
+
+
     async def _forward_http(self, request, inbound, reader, writer, upstream_reader, upstream_writer, path, authority):
         outbound = h11.Connection(h11.CLIENT)
         upstream_writer.write(outbound.send(h11.Request(
@@ -164,32 +193,8 @@ class HTTPProxyServer:
             headers=headers_for_forwarding(request.headers, host=authority))))
         await upstream_writer.drain()
 
-        async def send_body():
-            while True:
-                event = await self._read_event(inbound, reader)
-                if not isinstance(event, (h11.Data, h11.EndOfMessage)):
-                    raise ProxyError("Incomplete HTTP request body")
-                upstream_writer.write(outbound.send(event))
-                await upstream_writer.drain()
-                if isinstance(event, h11.EndOfMessage):
-                    return
-
-        async def receive_response():
-            while True:
-                event = await self._read_event(outbound, upstream_reader)
-                if isinstance(event, (h11.Response, h11.InformationalResponse)):
-                    if event.status_code == 101:
-                        raise ProxyError("HTTP Upgrade is unsupported; use CONNECT")
-                    event = type(event)(status_code=event.status_code, reason=event.reason,
-                                       headers=headers_for_forwarding(event.headers))
-                elif not isinstance(event, (h11.Data, h11.EndOfMessage)):
-                    raise ProxyError("Incomplete upstream response")
-                writer.write(inbound.send(event))
-                await writer.drain()
-                if isinstance(event, h11.EndOfMessage):
-                    return
-
-        tasks = [asyncio.create_task(send_body()), asyncio.create_task(receive_response())]
+        tasks = [asyncio.create_task(self._send_body(inbound, reader, outbound, upstream_writer)),
+                 asyncio.create_task(self._receive_response(outbound, upstream_reader, inbound, writer))]
         try:
             # The response may finish before the request body (e.g. an upstream rejection).
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -237,23 +242,29 @@ class HTTPProxyServer:
                 if port != 80:
                     authority += f":{port}"
                 await self._forward_http(request, inbound, reader, writer, upstream_reader, upstream_writer, path, authority)
-        except (OSError, TimeoutError, ValueError, ProxyError, h11.ProtocolError,
+        except (OSError, ValueError, ProxyError, h11.ProtocolError,
                 asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             # Never append an HTTP error after a response or tunnel has begun.
             if not connected and inbound.our_state in (h11.IDLE, h11.SEND_RESPONSE):
-                reason = b"Bad Request" if status == 400 else b"Bad Gateway"
-                writer.write(b"HTTP/1.1 " + str(status).encode() + b" " + reason
-                             + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                await self._send_error(writer, status)
+        finally:
+            await self._close_streams(upstream_writer, writer)
+            self._tasks.discard(task)
+
+    async def _send_error(self, writer, status):
+        reason = b"Bad Request" if status == 400 else b"Bad Gateway"
+        writer.write(b"HTTP/1.1 " + str(status).encode() + b" " + reason
+                     + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        try:
+            await writer.drain()
+        except OSError:
+            pass
+
+    async def _close_streams(self, *streams):
+        for stream in streams:
+            if stream:
+                stream.close()
                 try:
-                    await writer.drain()
+                    await stream.wait_closed()
                 except OSError:
                     pass
-        finally:
-            for stream in (upstream_writer, writer):
-                if stream:
-                    stream.close()
-                    try:
-                        await stream.wait_closed()
-                    except OSError:
-                        pass
-            self._tasks.discard(task)
