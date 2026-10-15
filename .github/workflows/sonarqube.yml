@@ -10,6 +10,7 @@ jobs:
     name: SonarQube quality gate
     if: >-
       vars.SONAR_ENABLED == 'true' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.conclusion == 'success' &&
       (github.event.workflow_run.event == 'pull_request' ||
        (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
@@ -18,7 +19,7 @@ jobs:
     permissions:
       actions: read
       contents: read
-      pull-requests: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
