@@ -95,6 +95,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          tar -czf dist/ssh-tunnel-switch-install.tar.gz examples deploy docs LICENSE README.md
-          (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
-          gh release upload "$RELEASE_TAG" dist/*.whl dist/*.tar.gz dist/SHA256SUMS
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf dist/ssh-tunnel-switch-install.tar.gz examples deploy docs LICENSE README.md
+          (cd dist && sha256sum ./*.whl ./*.tar.gz > SHA256SUMS)
+          python scripts/attach-release.py
