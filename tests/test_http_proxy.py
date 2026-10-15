@@ -165,7 +165,8 @@ async def test_expect_continue(network):
         await writer.wait_closed()
 
 
-async def test_connect_transports_real_tls(network, tmp_path):
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_connect_transports_real_tls(network, tmp_path, streamed):
     key, certificate = tmp_path / "key.pem", tmp_path / "cert.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                     "-keyout", str(key), "-out", str(certificate), "-subj", "/CN=localhost",
@@ -174,11 +175,16 @@ async def test_connect_transports_real_tls(network, tmp_path):
     context.load_cert_chain(certificate, key)
     async def origin(reader, writer):
         assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"GET /secure HTTP/1.1")
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecure")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
         await writer.drain()
+        for byte in b"secure":
+            writer.write(bytes([byte]))
+            await writer.drain()
+            if streamed:
+                await asyncio.sleep(0.05)
     origin_port = await network(origin, ssl=context)
     trusted = ssl.create_default_context(cafile=str(certificate))
-    async with bridge(network) as (port, destinations, _):
+    async with bridge(network, idle_timeout_seconds=0.2 if streamed else 120) as (port, destinations, _):
         async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}", verify=trusted, trust_env=False) as client:
             response = await client.get(f"https://localhost:{origin_port}/secure")
             assert response.text == "secure" and response.status_code == 200
@@ -261,3 +267,63 @@ def test_listener_collision_validation():
     document["http_proxy"] = {"ip": "0.0.0.0", "port": 8765}
     with pytest.raises(ValidationError, match="different sockets"):
         Config.model_validate(document)
+
+
+@pytest.mark.parametrize("direction", ["download", "upload"])
+async def test_connect_active_stream_survives_quiet_opposite_direction(network, direction):
+    chunk = b"tick"
+    count = 10
+
+    async def origin(reader, writer):
+        if direction == "download":
+            assert await reader.readexactly(5) == b"start"
+            for _ in range(count):
+                writer.write(chunk)
+                await writer.drain()
+                await asyncio.sleep(0.05)
+        else:
+            assert await reader.read() == chunk * count
+            writer.write(b"done")
+            await writer.drain()
+
+    origin_port = await network(origin)
+    async with bridge(network, idle_timeout_seconds=0.2) as (port, _, _):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(f"CONNECT localhost:{origin_port} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            await writer.drain()
+            assert b"200" in await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+            if direction == "download":
+                writer.write(b"start")
+                await writer.drain()
+                assert await asyncio.wait_for(reader.read(), 2) == chunk * count
+            else:
+                for _ in range(count):
+                    writer.write(chunk)
+                    await writer.drain()
+                    await asyncio.sleep(0.05)
+                writer.write_eof()
+                assert await asyncio.wait_for(reader.read(), 2) == b"done"
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+
+async def test_connect_closes_when_both_directions_are_idle(network):
+    async def origin(reader, writer):
+        await reader.read()
+
+    origin_port = await network(origin)
+    async with bridge(network, idle_timeout_seconds=0.2) as (port, _, _):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(f"CONNECT localhost:{origin_port} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            await writer.drain()
+            assert b"200" in await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+            assert await asyncio.wait_for(reader.read(), 2) == b""
+        finally:
+            writer.close()
+            await writer.wait_closed()

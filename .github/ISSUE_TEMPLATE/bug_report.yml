@@ -1,0 +1,58 @@
+name: Bug report
+description: Report an API, SSH tunnel or proxy problem.
+title: '[Bug]: '
+labels: [bug, needs-triage]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - REST API or token configuration
+        - SSH connection or rotation
+        - HTTP proxy or HTTPS CONNECT
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: Include the repository revision, OS, Python and OpenSSH versions.
+      placeholder: 'OS: ...; Python: ...; OpenSSH: ...; revision: ...'
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest set of commands or actions that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and relevant error
+      description: Include a short error excerpt.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Sanitized configuration
+      description: Include relevant YAML, SSH Host settings. Replace tokens, credentials, private keys and sensitive hostnames/addresses with placeholders.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked for an existing matching issue.
+          required: true
+        - label: I removed credentials and sensitive deployment information from this report.
+          required: true

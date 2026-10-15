@@ -9,15 +9,30 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    permissions:
+      contents: read
+      actions: read
     if: startsWith(github.event.release.tag_name, 'service-v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
+      - name: Require the released commit to be on main with successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+          commit=$(git rev-parse HEAD)
+          gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$commit&event=push&status=completed" --jq '.workflow_runs | any(.conclusion == "success")' | grep '^true$'
+          gh api "repos/$GH_REPO/actions/workflows/codeql.yml/runs?head_sha=$commit&event=push&status=completed" --jq '.workflow_runs | any(.conclusion == "success")' | grep '^true$'
       - name: Check release version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -28,9 +43,10 @@ jobs:
               version = tomllib.load(stream)['project']['version']
           assert os.environ['RELEASE_TAG'] == f'service-v{version}'
           PYCODE
-      - run: python -m pip install -e '.[test]' build twine
-      - run: python -m pytest -q
-      - run: python -m build
+      - run: >-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
+      - run: PYTHONPATH=src python -m pytest -q
+      - run: python -m build --no-isolation
       - run: python -m twine check dist/*
       - run: python scripts/verify-package.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -41,6 +57,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/project/ssh-tunnel-switch/
@@ -52,3 +69,34 @@ jobs:
           name: python-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          skip-existing: true
+
+  verify:
+    name: Verify published package
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: python-distributions
+          path: dist/
+      - run: python scripts/verify-registry.py --registry pypi
+      - name: Attach verified release artifacts and installation files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf dist/ssh-tunnel-switch-install.tar.gz examples deploy docs LICENSE README.md
+          (cd dist && sha256sum ./*.whl ./*.tar.gz > SHA256SUMS)
+          python scripts/attach-release.py

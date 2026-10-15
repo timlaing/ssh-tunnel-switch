@@ -1,0 +1,27 @@
+"area: api":
+  - changed-files:
+      - any-glob-to-any-file: ['src/tunnel_switch/api.py', 'src/tunnel_switch/cli.py', 'src/tunnel_switch/config.py', 'examples/**']
+"area: ssh":
+  - changed-files:
+      - any-glob-to-any-file: ['src/tunnel_switch/tunnel.py', 'src/tunnel_switch/state.py']
+"area: proxy":
+  - changed-files:
+      - any-glob-to-any-file: ['src/tunnel_switch/http_proxy.py']
+"area: packaging":
+  - changed-files:
+      - any-glob-to-any-file: ['pyproject.toml', 'scripts/**', '.github/workflows/publish*.yml']
+"area: deployment":
+  - changed-files:
+      - any-glob-to-any-file: ['deploy/**', 'docs/deployment.md']
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ['**/*.md', 'LICENSE']
+tests:
+  - changed-files:
+      - any-glob-to-any-file: ['tests/**']
+ci:
+  - changed-files:
+      - any-glob-to-any-file: ['.github/**']
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file: ['pyproject.toml', '.github/dependabot.yml']

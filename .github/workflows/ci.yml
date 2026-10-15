@@ -38,16 +38,48 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: requirements-ci.txt
       - name: Use Homebrew OpenSSL on macOS
         if: runner.os == 'macOS'
         run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - name: Install test and packaging dependencies
-        run: python -m pip install -e '.[test]' build twine
+        run: >-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
       - name: Test standalone service and proxy
-        run: python -m pytest -q
+        run: PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml
+      - name: Normalize Python coverage paths to repository root
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          node = tree.getroot().find('sources')
+          sources = [Path(item.text) for item in node if item.text]
+          for item in tree.getroot().iter('class'):
+              path = Path(item.attrib['filename'])
+              choices = [path, *[source / path for source in sources]]
+              matches = [candidate for candidate in choices if candidate.is_file() and not candidate.is_absolute() and '..' not in candidate.parts]
+              if not matches:
+                  raise ValueError(f'Cannot map coverage file: {path}')
+              item.set('filename', matches[0].as_posix())
+          node.clear()
+          ET.SubElement(node, 'source').text = '.'
+          tree.write('coverage.xml', encoding='utf-8', xml_declaration=True)
+          PYCODE
+      - name: Record Python coverage revision
+        run: git rev-parse HEAD > coverage-revision.txt
+      - name: Upload Python coverage for SonarQube
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-coverage
+          path: |
+            coverage.xml
+            coverage-revision.txt
+          if-no-files-found: error
+          retention-days: 7
       - name: Build Python distribution
-        run: python -m build
+        run: python -m build --no-isolation
       - run: python -m twine check dist/*
       - run: python scripts/verify-package.py
       - name: Verify installed wheel and CLI
@@ -72,3 +104,38 @@ jobs:
           sudo mkdir -p /opt/tunnel-switch/.venv/bin
           sudo ln -s /usr/bin/true /opt/tunnel-switch/.venv/bin/tunnel-switch
           systemd-analyze verify --man=no deploy/systemd/tunnel-switch.service
+
+  ssh:
+    name: Real SSH integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: >-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
+      - name: Test real OpenSSH startup, rotation, failures and cleanup
+        run: PYTHONPATH=src python -m pytest -q -m ssh_integration
+        env:
+          TUNNEL_SWITCH_TEST_SSH: '1'
+
+  lint:
+    name: Python lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: >-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
+      - run: ruff check .

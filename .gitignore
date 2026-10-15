@@ -6,3 +6,10 @@ dist/
 /config.yaml
 .env
 .DS_Store
+
+coverage.xml
+.coverage
+coverage/
+.scannerwork/
+
+.sonar-coverage/

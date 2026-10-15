@@ -1,0 +1,19 @@
+Port 22
+HostKey /tmp/ssh_host_ed25519_key
+PidFile /tmp/sshd.pid
+AuthorizedKeysFile /tmp/test_authorized_keys
+# The test public key is copied into a root-owned file in the container.
+StrictModes no
+PermitRootLogin no
+AllowUsers tunnel
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:8080
+X11Forwarding no
+AllowAgentForwarding no
+LogLevel ERROR
