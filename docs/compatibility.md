@@ -10,6 +10,6 @@
 | Python distributions | Wheel and sdist install in fresh environments. Examples and license are checked; the wheel ships the `init-config` template. |
 | External clients | Any supported HTTP/SOCKS proxy client or bearer-authenticated REST client. No plugin dependency. |
 
-Version 0.1.0 requires explicit YAML configuration and starts with the first SSH server. Version 0.1.1 adds configuration discovery, persistent restart selection, startup overrides, `init-config`, and the CONNECT stream inactivity fix. The `tunnel-switch` CLI, `tunnel_switch` imports and REST endpoint shapes are retained.
+Version 0.1.0 requires explicit YAML configuration and starts with the first SSH server. Version 1.0.0 adds configuration discovery, persistent restart selection, startup overrides, `init-config`, and the CONNECT stream inactivity fix. The `tunnel-switch` CLI, `tunnel_switch` imports and REST endpoint shapes are retained.
 
 Local tests use fixtures and do not establish that a particular remote SSH account or client application is correctly configured. See the current [CI runs](https://github.com/timlaing/ssh-tunnel-switch/actions/workflows/ci.yml) and release notes for evidence tied to a revision.

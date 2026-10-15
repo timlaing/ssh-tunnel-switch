@@ -4,7 +4,7 @@ Start with `tunnel-switch validate --config /path/to/config.yaml`, then check SS
 
 | Symptom | Check |
 | --- | --- |
-| Configuration missing | Pass `--config`; version 0.1.1 also checks `~/.config/ssh-tunnel-switch/config.yaml`, then `./config.yaml`. Use `init-config` to create an example. |
+| Configuration missing | Pass `--config`; version 1.0.0 also checks `~/.config/ssh-tunnel-switch/config.yaml`, then `./config.yaml`. Use `init-config` to create an example. |
 | Validation fails | Unknown fields, duplicate server names, invalid sockets and missing identity files are rejected. Relative identity paths resolve from the YAML directory. |
 | SSH fails | Verify `ssh -G <alias>`, known-host fingerprints, key/agent access and server TCP-forwarding permissions. Batch mode does not prompt. |
 | Service differs from a terminal | The systemd account has its own SSH home and does not inherit the desktop SSH agent. See the deployment guide. |
@@ -14,10 +14,10 @@ Start with `tunnel-switch validate --config /path/to/config.yaml`, then check SS
 | Rotation returns 503 | Check SSH authentication, forwarding and readiness. After the cooldown, the next rotation advances through the list. |
 | Proxy returns 502 | The SOCKS tunnel or destination is unavailable; there is no direct fallback. Check `/status` and SSH logs. |
 | Proxy returns 503 | The HTTP proxy connection limit was reached. Check active clients and `max_connections`. |
-| Stream closes despite active traffic | Upgrade to 0.1.1 or later, which measures CONNECT inactivity across both directions. Existing connections close during rotation. |
-| Restart selects an unexpected server | Check `state_file`, `server_name` and CLI overrides. Version 0.1.1 remembers the last successful server. Invalid state fails startup; state whose server was removed or renamed falls back to the first configured server. |
+| Stream closes despite active traffic | Upgrade to 1.0.0 or later, which measures CONNECT inactivity across both directions. Existing connections close during rotation. |
+| Restart selects an unexpected server | Check `state_file`, `server_name` and CLI overrides. Version 1.0.0 remembers the last successful server. Invalid state fails startup; state whose server was removed or renamed falls back to the first configured server. |
 | Cannot save token or state | Check parent-directory permissions and systemd writable paths. Saving uses atomic replacement and needs directory access. |
-| Missing `init-config` command | Version 0.1.0 predates it. Use the example YAML or upgrade once 0.1.1 is released. |
+| Missing `init-config` command | Version 0.1.0 predates it. Use the example YAML or upgrade to 1.0.0. |
 
 Use direct REST calls when diagnosing routing: `curl --noproxy '*' -H 'Authorization: Bearer <token>' http://127.0.0.1:8765/status`. Do not share the real token, private keys, hostnames or unredacted journal output.
 

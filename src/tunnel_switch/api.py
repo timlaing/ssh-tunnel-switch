@@ -29,7 +29,7 @@ def create_app(config: Config, token: str, manager: TunnelManager | None = None)
     app.state.manager = manager
     app.state.http_proxy = proxy
 
-    async def authorize(authorization: str | None = Header(default=None)):
+    def authorize(authorization: str | None = Header(default=None)):
         if authorization is None or not secrets.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
@@ -39,7 +39,9 @@ def create_app(config: Config, token: str, manager: TunnelManager | None = None)
             "enabled": config.http_proxy.enabled, "ip": str(config.http_proxy.ip),
             "port": config.http_proxy.port}}
 
-    @app.post("/rotate", dependencies=[Depends(authorize)])
+    @app.post("/rotate", dependencies=[Depends(authorize)], responses={
+        429: {"description": "Rotation already running or cooling down"},
+        503: {"description": "SSH tunnel could not be established"}})
     async def rotate():
         try:
             return await manager.rotate()

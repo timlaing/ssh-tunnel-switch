@@ -12,7 +12,7 @@ python3 -m venv .venv
 .venv/bin/tunnel-switch init-config --output config.yaml
 ```
 
-`init-config` is available from version 0.1.1. It creates a mode-0600 example and refuses to overwrite existing files. For 0.1.0, download the [example configuration](https://raw.githubusercontent.com/timlaing/ssh-tunnel-switch/service-v0.1.0/examples/config.yaml) and protect it with `chmod 600 config.yaml`.
+`init-config` is available from version 1.0.0. It creates a mode-0600 example and refuses to overwrite existing files. For 0.1.0, download the [example configuration](https://raw.githubusercontent.com/timlaing/ssh-tunnel-switch/service-v0.1.0/examples/config.yaml) and protect it with `chmod 600 config.yaml`.
 
 Edit the SSH host aliases in the YAML. Verify host keys and key/agent authentication using your normal SSH client before starting the service. SSH accounts must allow TCP forwarding. Existing `~/.ssh/config` settings apply when YAML does not override them.
 

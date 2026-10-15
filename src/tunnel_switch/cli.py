@@ -77,7 +77,10 @@ def serve(
 def request(path: Path | None, method: str, endpoint: str):
     cfg, token = settings(path)
     ip = str(cfg.api.ip)
-    ip = "127.0.0.1" if ip == "0.0.0.0" else "::1" if ip == "::" else ip
+    if ip == "0.0.0.0":
+        ip = "127.0.0.1"
+    elif ip == "::":
+        ip = "::1"
     host = f"[{ip}]" if ":" in ip else ip
     response = httpx.request(method, f"http://{host}:{cfg.api.port}/{endpoint}",
                              headers={"Authorization": f"Bearer {token}"},
