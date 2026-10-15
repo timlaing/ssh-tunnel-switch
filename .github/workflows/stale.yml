@@ -1,0 +1,50 @@
+name: Stale issues and pull requests
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: stale-maintenance
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: 'keep-open,security,priority: high'
+          exempt-pr-labels: 'keep-open,security,priority: high'
+          exempt-all-milestones: true
+          exempt-draft-pr: true
+          remove-stale-when-updated: true
+          delete-branch: false
+          operations-per-run: 100
+          close-issue-reason: not_planned
+          stale-issue-message: >-
+            This issue has had no activity for 60 days. It will close in 14 days
+            unless there is new activity. Please add an update if it is still
+            relevant. A maintainer can apply keep-open to retain it.
+          close-issue-message: >-
+            Closed after a further 14 days without activity. This does not mean
+            the issue was fixed; please reopen it with an update if it still applies.
+          stale-pr-message: >-
+            This pull request has had no activity for 30 days. It will close in
+            14 days unless there is new activity. Please comment or push an update
+            to continue, or ask a maintainer to apply keep-open.
+          close-pr-message: >-
+            Closed after a further 14 days without activity. The source branch
+            has been retained; this pull request can be reopened when work resumes.

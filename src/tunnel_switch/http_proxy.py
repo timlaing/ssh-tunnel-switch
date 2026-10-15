@@ -116,21 +116,42 @@ class HTTPProxyServer:
             connection.receive_data(data)
 
     async def _relay_connect(self, client_reader, client_writer, upstream_reader, upstream_writer):
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
+
         async def pump(reader, writer):
-            while data := await asyncio.wait_for(reader.read(65536), self.config.http_proxy.idle_timeout_seconds):
+            nonlocal last_activity
+            while data := await reader.read(65536):
+                last_activity = loop.time()
                 writer.write(data)
                 await writer.drain()
+                last_activity = loop.time()
             if writer.can_write_eof():
                 writer.write_eof()
                 await writer.drain()
+
+        async def watch_idle():
+            # HTTPS requests can be quiet in one direction throughout a streamed
+            # response. Only silence across the entire tunnel is inactivity.
+            while True:
+                remaining = self.config.http_proxy.idle_timeout_seconds - (loop.time() - last_activity)
+                if remaining <= 0:
+                    raise TimeoutError("CONNECT tunnel inactive")
+                await asyncio.sleep(remaining)
+
         tasks = [asyncio.create_task(pump(client_reader, upstream_writer)),
-                 asyncio.create_task(pump(upstream_reader, client_writer))]
+                 asyncio.create_task(pump(upstream_reader, client_writer)),
+                 asyncio.create_task(watch_idle())]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
             if tasks[1] not in done:
-                await tasks[1]
+                # Preserve client half-close: the upstream may still send its
+                # response, but the shared inactivity deadline still applies.
+                done, _ = await asyncio.wait(tasks[1:], return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
         finally:
             for task in tasks:
                 task.cancel()

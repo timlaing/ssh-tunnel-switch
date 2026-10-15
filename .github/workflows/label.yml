@@ -1,0 +1,58 @@
+name: Automatic labels
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      # Metadata only: do not check out or execute pull request code.
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const item = context.payload.issue ?? context.payload.pull_request;
+            const labels = new Set();
+            if (context.eventName === 'issues') {
+              if (context.payload.action === 'opened') labels.add('needs-triage');
+              const title = item.title ?? '';
+              if (/^\[Bug\]:/i.test(title)) labels.add('bug');
+              if (/^\[Feature\]:/i.test(title)) labels.add('enhancement');
+              const component = (item.body ?? '').match(/### Affected component\s+([^\r\n]+)/)?.[1]?.trim();
+              const components = {
+                'REST API or token configuration': 'area: api',
+                'SSH connection or rotation': 'area: ssh',
+                'HTTP proxy or HTTPS CONNECT': 'area: proxy',
+              };
+              if (components[component]) labels.add(components[component]);
+            } else {
+              const type = (item.title ?? '').match(/^(fix|feat|docs|ci|test|build)(?:\([^)]*\))?!?:/i)?.[1]?.toLowerCase();
+              const types = {fix: 'bug', feat: 'enhancement', docs: 'documentation', ci: 'ci', test: 'tests', build: 'dependencies'};
+              if (types[type]) labels.add(types[type]);
+              if (item.user?.login === 'dependabot[bot]') labels.add('dependencies');
+            }
+            if (labels.size) await github.rest.issues.addLabels({
+              ...context.repo, issue_number: item.number, labels: [...labels],
+            });
+
+  changed-files:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Uses trusted base-branch configuration through the API; no checkout.
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          sync-labels: false

@@ -27,3 +27,8 @@ cooldown_seconds: 30
 startup_timeout_seconds: 15
 stop_timeout_seconds: 5
 start_on_launch: true
+# Defaults to this file under the service account's home directory.
+# Set null to disable persistence; relative paths are resolved beside this YAML.
+state_file: ~/.config/ssh-tunnel-switch/state.json
+# Optional starting server name; null resumes the saved server.
+server_name: null

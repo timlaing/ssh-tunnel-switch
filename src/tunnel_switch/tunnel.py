@@ -4,6 +4,7 @@ import socket
 import time
 from uuid import uuid4
 from .config import Config, Server
+from .state import load_last_server, save_last_server
 
 
 class RotationRejected(Exception):
@@ -24,7 +25,13 @@ class TunnelManager:
         self.started_at = None
         self.server_name = None
         self.last_error = None
-        self._index = -1
+        remembered = next((index for index, server in enumerate(config.servers)
+                           if server.name == config.server_name), None)
+        if remembered is None and config.state_file is not None:
+            remembered = load_last_server(config.state_file, config.servers)
+        # rotate() advances before connecting: the first connection after restart
+        # resumes the saved server, then subsequent rotations advance normally.
+        self._index = remembered - 1 if remembered is not None else -1
         self._busy = False
         self._last_rotation = None
 
@@ -133,6 +140,16 @@ class TunnelManager:
                         self.connection_id = str(uuid4())
                         self.started_at = datetime.now(timezone.utc)
                         self.server_name = server.name
+                        if self.config.state_file is not None:
+                            # Serialize completion even on cancellation: an older
+                            # background save must never overwrite a newer rotation.
+                            save = asyncio.create_task(asyncio.to_thread(
+                                save_last_server, self.config.state_file, server))
+                            try:
+                                await asyncio.shield(save)
+                            except asyncio.CancelledError:
+                                await save
+                                raise
                         break
                 await asyncio.sleep(0.1)
             else:

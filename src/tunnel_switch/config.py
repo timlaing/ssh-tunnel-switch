@@ -61,9 +61,13 @@ class Config(StrictModel):
     startup_timeout_seconds: float = Field(default=15, gt=0, le=120)
     stop_timeout_seconds: float = Field(default=5, gt=0, le=60)
     start_on_launch: bool = True
+    state_file: Path | None = Field(default_factory=lambda: Path("~/.config/ssh-tunnel-switch/state.json").expanduser())
+    server_name: str | None = None
 
     @model_validator(mode="after")
     def unique_names(self):
+        if self.server_name is not None and self.server_name not in {server.name for server in self.servers}:
+            raise ValueError("server_name must match a configured server name")
         if len({server.name for server in self.servers}) != len(self.servers):
             raise ValueError("SSH server names must be unique")
         listeners = [self.proxy, self.api]
@@ -86,7 +90,21 @@ def load_config(path: Path) -> Config:
             server.identity_file = identity if identity.is_absolute() else path.resolve().parent / identity
             if not server.identity_file.is_file():
                 raise ValueError(f"Identity file does not exist: {server.identity_file}")
+    if config.state_file is not None:
+        state = config.state_file.expanduser()
+        config.state_file = state if state.is_absolute() else path.resolve().parent / state
+        config.state_file = resolve_state_file(config.state_file, config, path)
     return config
+
+
+def resolve_state_file(state: Path, config: Config, config_path: Path) -> Path:
+    target = state.expanduser().resolve()
+    protected = {config_path.resolve(), *(s.identity_file.resolve() for s in config.servers if s.identity_file)}
+    if target in protected:
+        raise ValueError("State file must differ from the YAML configuration and SSH identity files")
+    if target.is_dir():
+        raise ValueError("State file must be a file, not a directory")
+    return target
 
 
 def ensure_api_token(path: Path, config: Config) -> str:

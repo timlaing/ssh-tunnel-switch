@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ssh-tunnel-switch"
-version = "0.1.0"
+version = "0.1.1"
 description = "SSH SOCKS5 tunnel rotation service with an HTTP proxy and REST API"
 readme = "README.md"
 license = "MIT"
@@ -26,9 +26,16 @@ tunnel-switch = "tunnel_switch.cli:main"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["ssh_integration: opt-in disposable Docker OpenSSH integration"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tunnel_switch"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/examples", "/deploy", "/docs", "/README.md", "/LICENSE", "/SECURITY.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/pyproject.toml"]
+include = ["/src", "/scripts", "/tests", "/examples", "/deploy", "/docs", "/README.md", "/LICENSE", "/SECURITY.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/pyproject.toml"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

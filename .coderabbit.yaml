@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+language: en-GB
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  auto_review:
+    enabled: true
+    auto_incremental_review: true

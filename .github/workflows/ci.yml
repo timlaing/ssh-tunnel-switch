@@ -72,3 +72,36 @@ jobs:
           sudo mkdir -p /opt/tunnel-switch/.venv/bin
           sudo ln -s /usr/bin/true /opt/tunnel-switch/.venv/bin/tunnel-switch
           systemd-analyze verify --man=no deploy/systemd/tunnel-switch.service
+
+  ssh:
+    name: Real SSH integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e '.[test]'
+      - name: Test real OpenSSH startup, rotation, failures and cleanup
+        run: python -m pytest -q -m ssh_integration
+        env:
+          TUNNEL_SWITCH_TEST_SSH: '1'
+
+  lint:
+    name: Python lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: python -m pip install 'ruff>=0.14,<1'
+      - run: ruff check .
