@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a API, SSH tunnel or proxy problem.
+description: Report an API, SSH tunnel or proxy problem.
 title: '[Bug]: '
 labels: [bug, needs-triage]
 body:

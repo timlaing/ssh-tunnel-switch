@@ -130,30 +130,11 @@ class TunnelManager:
             self.process = await asyncio.create_subprocess_exec(
                 *self.command(server), stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            deadline = time.monotonic() + self.config.startup_timeout_seconds
-            while time.monotonic() < deadline:
-                if self.process.returncode is not None:
-                    raise TunnelFailure(f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions")
-                if await self._ready():
-                    await asyncio.sleep(0.05)
-                    if self.process.returncode is None:
-                        self.connection_id = str(uuid4())
-                        self.started_at = datetime.now(timezone.utc)
-                        self.server_name = server.name
-                        if self.config.state_file is not None:
-                            # Serialize completion even on cancellation: an older
-                            # background save must never overwrite a newer rotation.
-                            save = asyncio.create_task(asyncio.to_thread(
-                                save_last_server, self.config.state_file, server))
-                            try:
-                                await asyncio.shield(save)
-                            except asyncio.CancelledError:
-                                await save
-                                raise
-                        break
-                await asyncio.sleep(0.1)
-            else:
-                raise TunnelFailure("SSH SOCKS startup timed out")
+            await self._wait_until_ready()
+            self.connection_id = str(uuid4())
+            self.started_at = datetime.now(timezone.utc)
+            self.server_name = server.name
+            await self._remember_server(server)
         except asyncio.CancelledError:
             await self._stop()
             raise
@@ -165,6 +146,30 @@ class TunnelManager:
             self._last_rotation = time.monotonic()
             self._busy = False
         return self.status()
+
+    async def _wait_until_ready(self):
+        """Wait for SOCKS readiness and a stable SSH process within its deadline."""
+        deadline = time.monotonic() + self.config.startup_timeout_seconds
+        while time.monotonic() < deadline:
+            if self.process.returncode is not None:
+                raise TunnelFailure(f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions")
+            if await self._ready():
+                await asyncio.sleep(0.05)
+                if self.process.returncode is None:
+                    return
+            await asyncio.sleep(0.1)
+        raise TunnelFailure("SSH SOCKS startup timed out")
+
+    async def _remember_server(self, server):
+        """Finish atomic persistence before allowing any subsequent rotation."""
+        if self.config.state_file is None:
+            return
+        save = asyncio.create_task(asyncio.to_thread(save_last_server, self.config.state_file, server))
+        try:
+            await asyncio.shield(save)
+        except asyncio.CancelledError:
+            await save
+            raise
 
     async def close(self):
         await self._stop()

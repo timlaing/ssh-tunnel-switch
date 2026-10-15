@@ -27,7 +27,7 @@ for attempt in range(6):
         with urllib.request.urlopen(f"https://{host}/pypi/{name}/{version}/json", timeout=30) as response:
             published = json.load(response)
         break
-    except (urllib.error.HTTPError, urllib.error.URLError):
+    except urllib.error.URLError:
         if attempt == 5:
             raise
         time.sleep(10)

@@ -185,7 +185,8 @@ async def test_real_ssh_server_loss_and_recovery(ssh_servers, monkeypatch):
         await asyncio.wait_for(process.wait(), 10)
         status = manager.status()
         assert status["state"] == "disconnected"
-        assert status["connection_id"] is None and status["started_at"] is None
+        assert status["connection_id"] is None
+        assert status["started_at"] is None
         assert (await manager.rotate())["server"] == "two"
         assert await asyncio.wait_for(forwarded_body(manager), 5) == b"two"
     finally:

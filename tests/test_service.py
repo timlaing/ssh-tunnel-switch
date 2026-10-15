@@ -385,8 +385,9 @@ async def test_missing_or_removed_state_starts_first_server(manager, tmp_path, m
 def test_invalid_state_fails_without_overwriting(tmp_path, contents):
     path = tmp_path / "state.json"
     path.write_text(contents)
+    settings = config(state_file=path)
     with pytest.raises(ValueError, match="Invalid tunnel state file"):
-        TunnelManager(config(state_file=path))
+        TunnelManager(settings)
     assert path.read_text() == contents
 
 
@@ -434,7 +435,8 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
     assert runner.invoke(app, ["serve", "--config", str(path), "--server-name", "missing"]).exit_code != 0
     assert not captured
     help_text = unstyle(runner.invoke(app, ["serve", "--help"]).output)
-    assert "--state-file" in help_text and "--server-name" in help_text
+    assert "--state-file" in help_text
+    assert "--server-name" in help_text
     with pytest.raises(ValidationError, match="server_name"):
         config(server_name="missing")
 
@@ -530,8 +532,9 @@ def test_state_directory_sync_failure_closes_handle(tmp_path, monkeypatch):
             raise OSError("directory sync failed")
         fsync(fd)
     monkeypatch.setattr("tunnel_switch.state.os.fsync", sync)
+    server = config().servers[0]
     with pytest.raises(OSError, match="directory sync failed"):
-        save_last_server(tmp_path / "state.json", config().servers[0])
+        save_last_server(tmp_path / "state.json", server)
     assert len(directories) == 2
     with pytest.raises(OSError):
         os.fstat(directories[0])

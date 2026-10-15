@@ -56,3 +56,13 @@ tunnel-switch --help
 `.github/labels.json` defines custom labels. A main push changing that file synchronizes labels without deleting other labels. Issues receive `needs-triage`; PR file paths and conventional titles add component/type labels. Inactive issues are warned after 60 days and PRs after 30 days, then closed after 14 further days. `keep-open`, `security`, `priority: high`, milestones and draft PRs are exempt as configured in the stale workflow.
 
 Dependabot checks Python and Actions dependencies weekly. Dependency audits and CodeQL also run weekly. Secret scanning, push protection and private vulnerability reporting are enabled; report vulnerabilities through the Security tab, not public issues.
+
+## SonarQube analysis
+
+The `SonarQube` workflow follows successful `CI` runs for main pushes and pull requests. CI uploads Python branch coverage; the scan downloads artifacts from that exact run and waits for the quality gate. It uses trusted workflow arguments, removes PR-controlled scanner properties, and does not execute repository code with the Sonar credential. `sonar-project.properties` documents the same source/test layout for local analysis.
+
+Project: `timlaing_ssh-tunnel-switch`, organization: `timlaing`, service: `https://sonarcloud.io`. Enable GitHub variable `SONAR_ENABLED=true` and supply Actions secret `SONAR_TOKEN` only after the Sonar project exists with matching visibility. Disable Sonar automatic analysis when using this CI workflow. A missing credential fails an enabled scan; disabled scanning is explicitly skipped.
+
+The public project is imported and CI scanning is enabled. Tokens are managed through GitHub Actions secrets; rotate them before the expiry recorded in `SONAR_TOKEN_EXPIRES_AT`.
+
+CI installs binary-only dependencies from the hash-verified `requirements-ci.txt` lock and runs the checkout with `PYTHONPATH=src`; credentials are not exposed to test code. After changing dependencies, regenerate the universal CI lock with `uv pip compile pyproject.toml --extra test --group ci --universal --generate-hashes --output-file requirements-ci.txt` and include it in the PR.
