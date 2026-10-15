@@ -34,7 +34,7 @@ Update `pyproject.toml` and the changelog through a reviewed PR. After main CI a
 
 Production publishing uses the `pypi` environment restricted to `service-v*` tags. Only the publishing job receives `id-token: write`. The verification job compares registry SHA256 values, installs the exact registry version, checks dependencies and runs the installed CLI with generated example configuration. Verified wheel, sdist, installation files and SHA256SUMS are attached to the GitHub release. Existing release assets are not overwritten.
 
-The PyPI publisher is configured for owner `timlaing`, repository `ssh-tunnel-switch`, workflow `publish-pypi.yml`, environment `pypi`. Versions cannot be overwritten. If publication succeeded but verification failed, investigate and rerun only the failed verification job; do not rebuild and republish the same version.
+The PyPI publisher is configured for owner `timlaing`, repository `ssh-tunnel-switch`, workflow `publish-pypi.yml`, environment `pypi`. Versions cannot be overwritten. Upload retries skip existing filenames; registry hash verification must still match every validated artifact, so different content is rejected. If publication succeeded but verification failed, investigate and rerun only the failed verification job; do not rebuild and republish the same version.
 
 ## TestPyPI builds from main
 
