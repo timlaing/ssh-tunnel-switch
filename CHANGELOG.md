@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 — Unreleased
+## 1.0.0 — 2026-10-15
 
 - Keep active CONNECT uploads/responses alive while either direction is active.
 - Remember the last successful SSH server across restarts; add `state_file` and `server_name`, CLI startup overrides, and standalone configuration discovery.

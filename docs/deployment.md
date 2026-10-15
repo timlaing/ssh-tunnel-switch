@@ -9,7 +9,7 @@ These instructions install files on a deployment host, not on your workstation.
 
 ## Install
 
-Use an approved source checkout at `/opt/tunnel-switch`, or download the verified installation files attached to releases from 0.1.1 onward. No GitHub authentication is needed for this public repository. Code and the virtual environment should be root-owned and not writable by the service account. On Debian/Ubuntu, install `openssh-client` and the `python3-venv` package matching a supported Python first.
+Use an approved source checkout at `/opt/tunnel-switch`, or download the verified installation files attached to releases from 1.0.0 onward. No GitHub authentication is needed for this public repository. Code and the virtual environment should be root-owned and not writable by the service account. On Debian/Ubuntu, install `openssh-client` and the `python3-venv` package matching a supported Python first.
 
 For a release installation, download every attached asset into an empty directory, run `sha256sum -c SHA256SUMS`, then extract `ssh-tunnel-switch-install.tar.gz` into `/opt/tunnel-switch` as root. The archive contains examples, deployment files and guides; the wheel is attached separately. Version 0.1.0 has no installation bundle: use its source archive for those files.
 
@@ -19,13 +19,13 @@ sudo useradd --system --user-group --create-home \
 sudo install -d -m 0700 -o tunnel-switch -g tunnel-switch /etc/tunnel-switch
 sudo install -d -m 0700 -o tunnel-switch -g tunnel-switch /var/lib/tunnel-switch/.ssh
 sudo python3 -m venv /opt/tunnel-switch/.venv
-sudo /opt/tunnel-switch/.venv/bin/python -m pip install 'ssh-tunnel-switch==0.1.1'
+sudo /opt/tunnel-switch/.venv/bin/python -m pip install 'ssh-tunnel-switch==1.0.0'
 sudo install -m 0600 -o tunnel-switch -g tunnel-switch \
   /opt/tunnel-switch/examples/config.yaml /etc/tunnel-switch/config.yaml
 sudoedit /etc/tunnel-switch/config.yaml
 ```
 
-Version 0.1.1 must be published before using that version pin. For a source installation, replace the pip argument with `/opt/tunnel-switch`. A verified downloaded wheel can also be installed by its absolute path.
+For a source installation, replace the pip argument with `/opt/tunnel-switch`. A verified downloaded wheel can also be installed by its absolute path.
 
 Run `useradd` only when the account does not already exist. The configuration
 directory is writable by the service because saving a newly generated token
