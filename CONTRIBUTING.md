@@ -20,3 +20,20 @@ Update the version in `pyproject.toml` and the changelog. Publish a GitHub relea
 Before the first release, create a pending Trusted Publisher in your PyPI account with project name `ssh-tunnel-switch`, owner `timlaing`, repository `ssh-tunnel-switch`, workflow `publish-pypi.yml`, and environment `pypi`. Configure the GitHub `pypi` environment and any desired reviewer protection. No PyPI API token is needed. See https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/ . A pending publisher does not guarantee name availability; PyPI confirms acceptance on publication.
 
 After publishing, verify the registry version and install `ssh-tunnel-switch==<version>` in a clean environment. Check `tunnel-switch --help` and example configuration validation before announcing the release.
+
+## TestPyPI builds from main
+
+A successful push CI run on `main`, including a merged pull request, triggers `publish-testpypi.yml`. It checks out the exact tested commit and assigns a unique `<release-version>.dev<build-serial>` version in the runner only. Each workflow attempt gets a different serial; the repository release version is unchanged. The workflow tests and validates wheel/sdist installs before publishing to TestPyPI. Pull request CI runs do not publish. Production PyPI remains limited to matching `service-v<version>` releases.
+
+Configure a pending Trusted Publisher in your separate TestPyPI account with project `ssh-tunnel-switch`, owner `timlaing`, repository `ssh-tunnel-switch`, workflow `publish-testpypi.yml`, and environment `testpypi`. The GitHub environment uses the same name.
+
+To try a test build, install its dependencies from production PyPI first, then install the exact development version from TestPyPI without dependency resolution:
+
+```sh
+python -m pip install fastapi uvicorn typer pydantic PyYAML ruamel.yaml httpx h11
+python -m pip install --index-url https://test.pypi.org/simple/ --no-deps 'ssh-tunnel-switch==<development-version>'
+python -m pip check
+tunnel-switch --help
+```
+
+Use an isolated environment. Dependency constraints are declared in `pyproject.toml`; `pip check` must pass before use.

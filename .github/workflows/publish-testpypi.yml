@@ -1,0 +1,73 @@
+name: Publish server to TestPyPI
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: testpypi-publish-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Assign a unique development version
+        env:
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python - <<'PYCODE'
+          import os, re, tomllib
+          from pathlib import Path
+          path = Path('pyproject.toml')
+          text = path.read_text()
+          base = tomllib.loads(text)['project']['version']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?', base):
+              raise ValueError('Expected a release version without a development suffix')
+          attempt = int(os.environ['BUILD_ATTEMPT'])
+          if not 1 <= attempt < 1000:
+              raise ValueError('Build attempt must be between 1 and 999')
+          serial = int(os.environ['BUILD_RUN_ID']) * 1000 + attempt
+          version = f'{base}.dev{serial}'
+          text, count = re.subn(r'^version = "[^"]+"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE)
+          if count != 1 or tomllib.loads(text)['project']['version'] != version:
+              raise ValueError('Could not set development version')
+          path.write_text(text)
+          print(f'TestPyPI version: {version}')
+          PYCODE
+      - run: python -m pip install -e '.[test]' build twine
+      - run: python -m pytest -q
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python scripts/verify-package.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/ssh-tunnel-switch/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          repository-url: https://test.pypi.org/legacy/
