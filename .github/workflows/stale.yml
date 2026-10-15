@@ -5,9 +5,7 @@ on:
     - cron: '23 7 * * *'
   workflow_dispatch:
 
-permissions:
-  issues: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: stale-maintenance
@@ -17,6 +15,10 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: write # Persist processing state in the Actions cache.
+      issues: write # Label and close stale issues.
+      pull-requests: write # Label and close stale pull requests.
     steps:
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10
         with:

@@ -66,12 +66,16 @@ jobs:
           ET.SubElement(node, 'source').text = '.'
           tree.write('coverage.xml', encoding='utf-8', xml_declaration=True)
           PYCODE
+      - name: Record Python coverage revision
+        run: git rev-parse HEAD > coverage-revision.txt
       - name: Upload Python coverage for SonarQube
         if: runner.os == 'Linux' && matrix.python == '3.13'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-coverage
-          path: coverage.xml
+          path: |
+            coverage.xml
+            coverage-revision.txt
           if-no-files-found: error
           retention-days: 7
       - name: Build Python distribution
