@@ -1,0 +1,33 @@
+[Unit]
+Description=SSH tunnel rotation API and HTTP proxy
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tunnel-switch
+Group=tunnel-switch
+WorkingDirectory=/var/lib/tunnel-switch
+ExecStart=/opt/tunnel-switch/.venv/bin/tunnel-switch serve --config /etc/tunnel-switch/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/tunnel-switch /var/lib/tunnel-switch
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

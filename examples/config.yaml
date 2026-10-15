@@ -1,0 +1,29 @@
+servers:
+  # Host aliases from ~/.ssh/config; User, Port and IdentityFile are inherited.
+  - host: ssh-one
+  - host: ssh-two
+  # Optional per-server overrides:
+  # - host: ssh-three
+  #   name: third
+  #   user: tunnel
+  #   port: 2222
+  #   identity_file: ~/.ssh/id_ed25519
+proxy:
+  ip: 127.0.0.1
+  port: 1080
+http_proxy:
+  enabled: true
+  ip: 127.0.0.1
+  port: 8118
+  connect_timeout_seconds: 10
+  idle_timeout_seconds: 120
+  max_connections: 128
+api:
+  ip: 127.0.0.1
+  port: 8765
+  # Leave unset to generate and save a token on service startup.
+  token: null
+cooldown_seconds: 30
+startup_timeout_seconds: 15
+stop_timeout_seconds: 5
+start_on_launch: true
