@@ -586,3 +586,25 @@ def test_init_config_is_private_and_does_not_overwrite(tmp_path):
     assert result.exit_code != 0
     assert path.read_bytes() == original
     assert CliRunner().invoke(app, ["validate", "--config", str(path)]).exit_code == 0
+
+
+@pytest.mark.parametrize("timeout_stage", ["connect", "read"])
+async def test_readiness_retries_after_transient_probe_timeout(monkeypatch, timeout_stage):
+    from unittest.mock import Mock
+
+    manager = TunnelManager(config(startup_timeout_seconds=2))
+    manager.process = Process()
+    reader = Mock()
+    reader.readexactly = AsyncMock(side_effect=[TimeoutError(), b"\x05\x00"] if timeout_stage == "read" else [b"\x05\x00"])
+    writer = Mock()
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    connections = [TimeoutError(), (reader, writer)] if timeout_stage == "connect" else [(reader, writer), (reader, writer)]
+    open_connection = AsyncMock(side_effect=connections)
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+
+    await manager._wait_until_ready()
+
+    assert open_connection.await_count == 2
+    assert writer.wait_closed.await_count == (1 if timeout_stage == "connect" else 2)
+    assert manager.process.returncode is None
