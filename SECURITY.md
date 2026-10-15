@@ -1,6 +1,6 @@
 # Security policy
 
-Report vulnerabilities privately using the repository Security tab once private vulnerability reporting is enabled. Do not post sensitive details in public issues. If reporting is unavailable, request a private reporting channel without disclosing the vulnerability. No response-time guarantee is offered. Fixes target the latest release and current development branch.
+Report vulnerabilities privately using [GitHub private vulnerability reporting](https://github.com/timlaing/ssh-tunnel-switch/security/advisories/new). Do not post sensitive details in public issues. If reporting is unavailable, request a private reporting channel without disclosing the vulnerability. No response-time guarantee is offered. Fixes target the latest release and current development branch.
 
 ## Deployment boundaries
 
