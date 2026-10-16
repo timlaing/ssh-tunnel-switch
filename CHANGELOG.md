@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add timestamps to every service and HTTP access log line and write them to a rotating, mode-0600 log file (`logging` YAML section with `file` and `level`).
+- Show a live terminal status display when `serve` runs interactively, while warnings and errors still reach stderr; non-interactive runs keep plain timestamped console lines for the journal. Fixes #6.
+- Harden the log path: reject non-regular files such as directories and FIFOs, refuse group- or world-writable log directories, and open the log without following symlinks.
+
 ## 1.0.0 — 2026-10-15
 
 - Resolve full-main Sonar findings: document rotation error responses, simplify proxy handlers and conditionals, remove redundant exceptions, and make test assertions independent.

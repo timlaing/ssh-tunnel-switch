@@ -1,10 +1,13 @@
 import asyncio
 from datetime import datetime, timezone
+import logging
 import socket
 import time
 from uuid import uuid4
 from .config import Config, Server
 from .state import load_last_server, save_last_server
+
+logger = logging.getLogger(__name__)
 
 
 class RotationRejected(Exception):
@@ -25,8 +28,14 @@ class TunnelManager:
         self.started_at = None
         self.server_name = None
         self.last_error = None
-        remembered = next((index for index, server in enumerate(config.servers)
-                           if server.name == config.server_name), None)
+        remembered = next(
+            (
+                index
+                for index, server in enumerate(config.servers)
+                if server.name == config.server_name
+            ),
+            None,
+        )
         if remembered is None and config.state_file is not None:
             remembered = load_last_server(config.state_file, config.servers)
         # rotate() advances before connecting: the first connection after restart
@@ -43,7 +52,9 @@ class TunnelManager:
         return {
             "state": state,
             "connection_id": self.connection_id if alive else None,
-            "started_at": self.started_at.isoformat() if alive and self.started_at else None,
+            "started_at": self.started_at.isoformat()
+            if alive and self.started_at
+            else None,
             "server": self.server_name if alive else None,
             "proxy": self.config.proxy.model_dump(mode="json"),
             "last_error": self.last_error,
@@ -52,12 +63,29 @@ class TunnelManager:
     def command(self, server: Server) -> list[str]:
         ip = str(self.config.proxy.ip)
         bind = f"[{ip}]" if ":" in ip else ip
-        args = ["ssh", "-N", "-T", "-D", f"{bind}:{self.config.proxy.port}",
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes",
-                "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                "-o", f"ConnectTimeout={int(self.config.startup_timeout_seconds) or 1}"]
+        args = [
+            "ssh",
+            "-N",
+            "-T",
+            "-D",
+            f"{bind}:{self.config.proxy.port}",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            f"ConnectTimeout={int(self.config.startup_timeout_seconds) or 1}",
+        ]
         if server.port is not None:
             args.extend(["-p", str(server.port)])
         if server.user is not None:
@@ -94,7 +122,9 @@ class TunnelManager:
             ip = "::1"
         writer = None
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, self.config.proxy.port), 0.5)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, self.config.proxy.port), 0.5
+            )
             writer.write(b"\x05\x01\x00")
             await writer.drain()
             return await asyncio.wait_for(reader.readexactly(2), 0.5) == b"\x05\x00"
@@ -106,13 +136,17 @@ class TunnelManager:
                 await writer.wait_closed()
 
     def _ensure_socket_free(self):
-        family = socket.AF_INET6 if self.config.proxy.ip.version == 6 else socket.AF_INET
+        family = (
+            socket.AF_INET6 if self.config.proxy.ip.version == 6 else socket.AF_INET
+        )
         with socket.socket(family) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((str(self.config.proxy.ip), self.config.proxy.port))
             except OSError as exc:
-                raise TunnelFailure("SOCKS bind address is already occupied or unavailable") from exc
+                raise TunnelFailure(
+                    "SOCKS bind address is already occupied or unavailable"
+                ) from exc
 
     async def rotate(self) -> dict:
         # No await before admission: atomic within the single service event loop.
@@ -122,27 +156,37 @@ class TunnelManager:
         if self._last_rotation is not None:
             remaining = self.config.cooldown_seconds - (now - self._last_rotation)
             if remaining > 0:
-                raise RotationRejected("Tunnel rotation cooldown active", int(remaining) + 1)
+                raise RotationRejected(
+                    "Tunnel rotation cooldown active", int(remaining) + 1
+                )
         self._busy = True
         self.last_error = None
+        # Select the target server first so every failure names it in the log.
+        self._index = (self._index + 1) % len(self.config.servers)
+        server = self.config.servers[self._index]
         try:
             await self._stop()
             self._ensure_socket_free()
-            self._index = (self._index + 1) % len(self.config.servers)
-            server = self.config.servers[self._index]
             self.process = await asyncio.create_subprocess_exec(
-                *self.command(server), stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                *self.command(server),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             await self._wait_until_ready()
             self.connection_id = str(uuid4())
             self.started_at = datetime.now(timezone.utc)
             self.server_name = server.name
             await self._remember_server(server)
+            logger.info(
+                "Tunnel connected to SSH server %s (%s)", server.name, server.host
+            )
         except asyncio.CancelledError:
             await self._stop()
             raise
         except Exception as exc:
             self.last_error = str(exc)
+            logger.exception("Tunnel rotation to server %s failed", server.name)
             await self._stop()
             raise TunnelFailure(str(exc)) from exc
         finally:
@@ -155,7 +199,9 @@ class TunnelManager:
         deadline = time.monotonic() + self.config.startup_timeout_seconds
         while time.monotonic() < deadline:
             if self.process.returncode is not None:
-                raise TunnelFailure(f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions")
+                raise TunnelFailure(
+                    f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions"
+                )
             if await self._ready():
                 await asyncio.sleep(0.05)
                 if self.process.returncode is None:
@@ -167,7 +213,9 @@ class TunnelManager:
         """Finish atomic persistence before allowing any subsequent rotation."""
         if self.config.state_file is None:
             return
-        save = asyncio.create_task(asyncio.to_thread(save_last_server, self.config.state_file, server))
+        save = asyncio.create_task(
+            asyncio.to_thread(save_last_server, self.config.state_file, server)
+        )
         try:
             await asyncio.shield(save)
         except asyncio.CancelledError:

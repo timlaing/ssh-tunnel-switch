@@ -99,7 +99,10 @@ The status command should report `connected`, a connection ID and a start time.
 does not confirm SSH connectivity. Configure clients after checking `/status`.
 
 Startup prints the API token as required by the CLI, so under systemd it appears
-in the journal. Read it only through a trusted local administrator session:
+in the journal. Timestamped service and access logs are also written to
+`logging.file` (default `~/.config/ssh-tunnel-switch/tunnel-switch.log` for the
+service account). Read either only through a trusted local administrator
+session:
 
 ```sh
 sudo journalctl -u tunnel-switch.service -n 50 --no-pager
