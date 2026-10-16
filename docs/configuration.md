@@ -73,10 +73,11 @@ panel is not shown.
 
 The log path must differ from the YAML and explicitly configured identity files
 and must be a regular file (a directory or FIFO is rejected). At write time the
-log directory must not be group- or world-writable — a sticky directory such as
-`/tmp` is exempt — and the log file itself is opened without following symlinks,
-so an attacker with write access to the directory cannot redirect log appends
-onto protected files.
+log directory must not be group-writable or world-writable — a sticky directory
+such as `/tmp` is exempt — and the final log-file component is opened without
+following symlinks. This stops the log file itself being replaced by a symlink
+that would redirect appends onto a protected file; it does not protect against
+an attacker who can replace an ancestor directory in the resolved path.
 
 ## Restart state and startup selection
 

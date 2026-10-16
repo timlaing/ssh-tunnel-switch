@@ -28,9 +28,10 @@ class PrivateFileHandler(RotatingFileHandler):
         if directory:
             os.makedirs(directory, mode=0o700, exist_ok=True)
             _check_directory_privacy(directory)
-        # O_NOFOLLOW refuses a symlink swapped in after configuration time, so
-        # appends cannot be redirected onto the YAML or identity files, and the
-        # mode is applied to the descriptor so it cannot hit a different path.
+        # O_NOFOLLOW refuses a symlink swapped in for the log file itself after
+        # configuration time, so appends cannot be redirected onto the YAML or
+        # identity files, and the mode is applied to the descriptor so it
+        # cannot hit a different path. Ancestor directories are not covered.
         descriptor = os.open(
             self.baseFilename,
             os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
