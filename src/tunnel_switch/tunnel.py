@@ -186,7 +186,7 @@ class TunnelManager:
             raise
         except Exception as exc:
             self.last_error = str(exc)
-            logger.error("Tunnel rotation to server %s failed: %s", server.name, exc)
+            logger.exception("Tunnel rotation to server %s failed", server.name)
             await self._stop()
             raise TunnelFailure(str(exc)) from exc
         finally:

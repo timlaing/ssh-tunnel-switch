@@ -212,7 +212,8 @@ def test_status_display_renders_until_stop_event(tmp_path):
     thread.join(timeout=10)
     assert not thread.is_alive()
     # The panel rendered the live status at least once before stopping.
-    assert renders and renders[0]["state"] == "disconnected"
+    assert renders
+    assert renders[0]["state"] == "disconnected"
 
 
 def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys):
@@ -281,16 +282,19 @@ def test_manager_logs_rotation_outcome(tmp_path, root_logging):
 
     class Sink(logging.Handler):
         def emit(self, record):
-            records.append(record.getMessage())
+            records.append(record)
 
     root_logging.addHandler(Sink())
     manager = TunnelManager(config())
     with pytest.raises(TunnelFailure):
         asyncio_run_rotation(manager)
-    failures = [m for m in records if "failed" in m]
+    failures = [r for r in records if "failed" in r.getMessage()]
     assert failures
-    assert failures[0].startswith("Tunnel rotation to server one failed:")
-    successes = [m for m in records if "connected" in m]
+    assert failures[0].getMessage().startswith("Tunnel rotation to server one failed")
+    # The failure is logged with its traceback for post-mortem diagnosis.
+    assert failures[0].exc_info is not None
+    assert failures[0].levelno == logging.ERROR
+    successes = [r for r in records if "connected" in r.getMessage()]
     assert not successes
 
 

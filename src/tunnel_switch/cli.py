@@ -166,7 +166,8 @@ def request(path: Path | None, method: str, endpoint: str):
     host = f"[{ip}]" if ":" in ip else ip
     response = httpx.request(
         method,
-        f"http://{host}:{cfg.api.port}/{endpoint}",
+        # Local loopback REST API served by this tool without TLS by design.
+        f"http://{host}:{cfg.api.port}/{endpoint}",  # NOSONAR S5332: loopback only
         headers={"Authorization": f"Bearer {token}"},
         timeout=cfg.startup_timeout_seconds + cfg.stop_timeout_seconds + 5,
         trust_env=False,
