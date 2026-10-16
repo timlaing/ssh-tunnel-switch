@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "typer>=0.15,<1", "pydantic>=2.10,<3", "PyYAML>=6,<7", "ruamel.yaml>=0.18,<0.20", "httpx>=0.28,<1", "h11>=0.16,<1"]
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "typer>=0.15,<1", "pydantic>=2.10,<3", "PyYAML>=6,<7", "ruamel.yaml>=0.18,<0.20", "httpx>=0.28,<1", "h11>=0.16,<1", "rich>=13,<16"]
 
 [project.urls]
 Homepage = "https://github.com/timlaing/ssh-tunnel-switch"

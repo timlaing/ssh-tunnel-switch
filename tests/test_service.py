@@ -14,23 +14,37 @@ from tunnel_switch.tunnel import TunnelManager, TunnelFailure, RotationRejected
 
 
 def config(**changes):
-    return Config.model_validate({"servers": [{"name": "one", "host": "one.example", "user": "tunnel"},
-                                               {"name": "two", "host": "two.example", "user": "tunnel"}],
-                                  "proxy": {"ip": "127.0.0.1", "port": 1080},
-                                  "start_on_launch": False, "state_file": None, "cooldown_seconds": 0, "http_proxy": {"enabled": False}, **changes})
+    return Config.model_validate(
+        {
+            "servers": [
+                {"name": "one", "host": "one.example", "user": "tunnel"},
+                {"name": "two", "host": "two.example", "user": "tunnel"},
+            ],
+            "proxy": {"ip": "127.0.0.1", "port": 1080},
+            "start_on_launch": False,
+            "state_file": None,
+            "cooldown_seconds": 0,
+            "http_proxy": {"enabled": False},
+            **changes,
+        }
+    )
 
 
 class Process:
     returncode = None
+
     def __init__(self):
         self.terminated = False
         self.killed = False
+
     def terminate(self):
         self.terminated = True
         self.returncode = 0
+
     def kill(self):
         self.killed = True
         self.returncode = -9
+
     async def wait(self):
         return self.returncode
 
@@ -40,7 +54,11 @@ def manager(monkeypatch):
     manager = TunnelManager(config())
     monkeypatch.setattr(manager, "_ensure_socket_free", lambda: None)
     monkeypatch.setattr(manager, "_ready", AsyncMock(return_value=True))
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=lambda *a, **kw: Process()))
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=lambda *a, **kw: Process()),
+    )
     return manager
 
 
@@ -60,10 +78,12 @@ async def test_rotation_stops_old_and_changes_id(manager):
 
 async def test_concurrent_rotation_rejected(manager):
     entered, release = asyncio.Event(), asyncio.Event()
+
     async def ready():
         entered.set()
         await release.wait()
         return True
+
     manager._ready = ready
     task = asyncio.create_task(manager.rotate())
     await entered.wait()
@@ -89,9 +109,11 @@ async def test_failure_cleans_process_and_cools_down(manager):
 
 async def test_cancelled_rotation_cleans_up(manager):
     entered = asyncio.Event()
+
     async def ready():
         entered.set()
         await asyncio.Event().wait()
+
     manager._ready = ready
     task = asyncio.create_task(manager.rotate())
     await entered.wait()
@@ -105,7 +127,9 @@ async def test_cancelled_rotation_cleans_up(manager):
 
 async def test_authenticated_api_and_busy_response(manager):
     app = create_app(manager.config, "secret", manager)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
         assert (await client.get("/status")).status_code == 401
         headers = {"Authorization": "Bearer secret"}
         assert (await client.post("/rotate", headers=headers)).status_code == 200
@@ -124,6 +148,7 @@ async def test_real_socks_handshake():
         writer.write(b"\x05\x00")
         await writer.drain()
         writer.close()
+
     server = await asyncio.start_server(socks, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     manager = TunnelManager(config(proxy={"ip": "127.0.0.1", "port": port}))
@@ -149,7 +174,9 @@ def test_config_and_cli(tmp_path):
 
 
 def test_main_failure_prints_help(monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["tunnel-switch", "validate", "--config", "/missing/config.yaml"])
+    monkeypatch.setattr(
+        "sys.argv", ["tunnel-switch", "validate", "--config", "/missing/config.yaml"]
+    )
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 1
@@ -170,11 +197,12 @@ def test_ipv6_command_uses_safe_args():
 async def test_real_subprocess_rotation(tmp_path, monkeypatch):
     import socket
     import sys
+
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     script = tmp_path / "fake_ssh.py"
-    script.write_text('''import asyncio, sys
+    script.write_text("""import asyncio, sys
 async def handle(reader, writer):
     try:
         data = await reader.readexactly(3)
@@ -188,9 +216,11 @@ async def main():
     async with server:
         await server.serve_forever()
 asyncio.run(main())
-''')
+""")
     manager = TunnelManager(config(proxy={"ip": "127.0.0.1", "port": port}))
-    monkeypatch.setattr(manager, "command", lambda server: [sys.executable, str(script), str(port)])
+    monkeypatch.setattr(
+        manager, "command", lambda server: [sys.executable, str(script), str(port)]
+    )
     try:
         first = await manager.rotate()
         old = manager.process
@@ -212,12 +242,20 @@ async def test_lifespan_closes_tunnel(manager):
 
 
 @pytest.mark.parametrize("token_line", ["", "  token: null\n", '  token: "   "\n'])
-def test_startup_generates_persists_and_prints_token(tmp_path, monkeypatch, capsys, token_line):
+def test_startup_generates_persists_and_prints_token(
+    tmp_path, monkeypatch, capsys, token_line
+):
     from tunnel_switch.cli import serve, settings
+
     path = tmp_path / "config.yaml"
-    path.write_text("# Keep this comment\nservers:\n  - name: one\n    host: one.example\n    user: tunnel\nproxy:\n  ip: 127.0.0.1\n  port: 1080\napi:\n  port: 8765 # API port\n" + token_line)
+    path.write_text(
+        "# Keep this comment\nservers:\n  - name: one\n    host: one.example\n    user: tunnel\nproxy:\n  ip: 127.0.0.1\n  port: 1080\napi:\n  port: 8765 # API port\n"
+        + token_line
+    )
     run = []
-    monkeypatch.setattr("tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: run.append(kwargs))
+    monkeypatch.setattr(
+        "tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: run.append(kwargs)
+    )
     serve(path)
     saved = load_config(path).api.token
     assert saved
@@ -236,6 +274,7 @@ def test_startup_generates_persists_and_prints_token(tmp_path, monkeypatch, caps
 
 def test_startup_displays_existing_yaml_token(tmp_path, monkeypatch, capsys):
     from tunnel_switch.cli import serve
+
     path = tmp_path / "config.yaml"
     document = config().model_dump(mode="json")
     document["api"]["token"] = "existing-test-token"
@@ -249,6 +288,7 @@ def test_startup_displays_existing_yaml_token(tmp_path, monkeypatch, capsys):
 
 def test_token_save_failure_prevents_startup(tmp_path, monkeypatch):
     from tunnel_switch.cli import serve, settings
+
     path = tmp_path / "config.yaml"
     path.write_text(json.dumps(config().model_dump(mode="json")))
     before = path.read_bytes()
@@ -256,8 +296,10 @@ def test_token_save_failure_prevents_startup(tmp_path, monkeypatch):
         settings(path)
     run = AsyncMock()
     monkeypatch.setattr("tunnel_switch.cli.uvicorn.run", run)
+
     def fail(*args):
         raise PermissionError("Cannot save config")
+
     monkeypatch.setattr("tunnel_switch.config.os.replace", fail)
     with pytest.raises(PermissionError):
         serve(path)
@@ -268,7 +310,9 @@ def test_token_save_failure_prevents_startup(tmp_path, monkeypatch):
 
 def test_host_only_server_loads_and_omits_ssh_overrides(tmp_path):
     path = tmp_path / "config.yaml"
-    path.write_text("servers:\n  - host: my-ssh-alias\nproxy:\n  ip: 127.0.0.1\n  port: 1080\nstate_file: null\n")
+    path.write_text(
+        "servers:\n  - host: my-ssh-alias\nproxy:\n  ip: 127.0.0.1\n  port: 1080\nstate_file: null\n"
+    )
     cfg = load_config(path)
     server = cfg.servers[0]
     assert server.name == "my-ssh-alias"
@@ -286,18 +330,27 @@ def test_host_only_server_loads_and_omits_ssh_overrides(tmp_path):
 @pytest.mark.parametrize("overrides", [False, True])
 def test_ssh_resolves_config_and_explicit_overrides(tmp_path, overrides):
     import subprocess
+
     ssh_config = tmp_path / "ssh_config"
     identity = tmp_path / "identity"
-    ssh_config.write_text(f"Host my-ssh-alias\n  HostName 127.0.0.1\n  User config-user\n  Port 2222\n  IdentityFile {identity}\n")
+    ssh_config.write_text(
+        f"Host my-ssh-alias\n  HostName 127.0.0.1\n  User config-user\n  Port 2222\n  IdentityFile {identity}\n"
+    )
     document = {"host": "my-ssh-alias"}
     if overrides:
         document.update(name="explicit-name", user="yaml-user", port=3333)
     cfg = config(servers=[document])
     command = TunnelManager(cfg).command(cfg.servers[0])
     # -G resolves options without connecting; -F isolates the test from personal SSH configuration.
-    result = subprocess.run(["ssh", "-G", "-F", str(ssh_config), *command[1:]],
-                            check=True, capture_output=True, text=True)
-    fields = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+    result = subprocess.run(
+        ["ssh", "-G", "-F", str(ssh_config), *command[1:]],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fields = dict(
+        line.split(" ", 1) for line in result.stdout.splitlines() if " " in line
+    )
     assert fields["hostname"] == "127.0.0.1"
     assert fields["user"] == ("yaml-user" if overrides else "config-user")
     assert fields["port"] == ("3333" if overrides else "2222")
@@ -315,10 +368,13 @@ def test_explicit_identity_is_passed_to_ssh(tmp_path):
     assert command[command.index("-i") + 1] == str(identity)
 
 
-@pytest.mark.parametrize("servers", [
-    [{"host": "same-alias"}, {"host": "same-alias"}],
-    [{"host": "first", "name": "second"}, {"host": "second"}],
-])
+@pytest.mark.parametrize(
+    "servers",
+    [
+        [{"host": "same-alias"}, {"host": "same-alias"}],
+        [{"host": "first", "name": "second"}, {"host": "second"}],
+    ],
+)
 def test_defaulted_names_must_be_unique(servers):
     with pytest.raises(ValidationError, match="unique"):
         config(servers=servers)
@@ -331,12 +387,18 @@ def ready_manager(cfg, monkeypatch):
     return resumed
 
 
-async def test_state_resumes_last_successful_server_after_reordering(manager, tmp_path, monkeypatch):
+async def test_state_resumes_last_successful_server_after_reordering(
+    manager, tmp_path, monkeypatch
+):
     path = tmp_path / "private" / "state.json"
     manager.config.state_file = path
     await manager.rotate()
     saved_connection = await manager.rotate()
-    assert json.loads(path.read_text()) == {"version": 1, "server": "two", "host": "two.example"}
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "server": "two",
+        "host": "two.example",
+    }
     assert path.stat().st_mode & 0o777 == 0o600
     await manager.close()
     assert path.exists()
@@ -364,13 +426,17 @@ async def test_failed_rotation_keeps_saved_server(manager, tmp_path):
     assert path.read_bytes() == original
 
 
-async def test_atomic_state_write_failure_preserves_previous_file(manager, tmp_path, monkeypatch):
+async def test_atomic_state_write_failure_preserves_previous_file(
+    manager, tmp_path, monkeypatch
+):
     path = tmp_path / "state.json"
     manager.config.state_file = path
     await manager.rotate()
     original = path.read_bytes()
+
     def fail(*args):
         raise PermissionError("State directory is not writable")
+
     monkeypatch.setattr("tunnel_switch.state.os.replace", fail)
     with pytest.raises(TunnelFailure, match="not writable"):
         await manager.rotate()
@@ -379,8 +445,12 @@ async def test_atomic_state_write_failure_preserves_previous_file(manager, tmp_p
     assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
 
 
-@pytest.mark.parametrize("saved", [None, {"version": 1, "server": "removed", "host": "removed.example"}])
-async def test_missing_or_removed_state_starts_first_server(manager, tmp_path, monkeypatch, saved):
+@pytest.mark.parametrize(
+    "saved", [None, {"version": 1, "server": "removed", "host": "removed.example"}]
+)
+async def test_missing_or_removed_state_starts_first_server(
+    manager, tmp_path, monkeypatch, saved
+):
     path = tmp_path / "state.json"
     if saved:
         path.write_text(json.dumps(saved))
@@ -391,7 +461,9 @@ async def test_missing_or_removed_state_starts_first_server(manager, tmp_path, m
         await resumed.close()
 
 
-@pytest.mark.parametrize("contents", ["not JSON", '{"version": 2, "server": "one", "host": "one.example"}'])
+@pytest.mark.parametrize(
+    "contents", ["not JSON", '{"version": 2, "server": "one", "host": "one.example"}']
+)
 def test_invalid_state_fails_without_overwriting(tmp_path, contents):
     path = tmp_path / "state.json"
     path.write_text(contents)
@@ -415,9 +487,13 @@ async def test_server_name_overrides_saved_selection(manager, tmp_path, monkeypa
 
 def test_state_paths_and_default_directory(tmp_path):
     from pathlib import Path
+
     path = tmp_path / "config.yaml"
     path.write_text("servers:\n  - host: one\nproxy: {}\n")
-    assert load_config(path).state_file == Path.home() / ".config/ssh-tunnel-switch/state.json"
+    assert (
+        load_config(path).state_file
+        == Path.home() / ".config/ssh-tunnel-switch/state.json"
+    )
     path.write_text(path.read_text() + "state_file: data/last.json\n")
     assert load_config(path).state_file == tmp_path / "data/last.json"
     path.write_text("servers:\n  - host: one\nproxy: {}\nstate_file: null\n")
@@ -433,16 +509,35 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     path.write_text(json.dumps(config().model_dump(mode="json")))
     captured = []
-    monkeypatch.setattr("tunnel_switch.cli.create_app", lambda cfg, token: captured.append(cfg) or object())
+    monkeypatch.setattr(
+        "tunnel_switch.cli.create_app",
+        lambda cfg, token, manager=None: captured.append(cfg) or object(),
+    )
     monkeypatch.setattr("tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: None)
     runner = CliRunner()
-    result = runner.invoke(app, ["serve", "--config", str(path), "--state-file", str(tmp_path / "cli.json"), "--server-name", "two"])
+    result = runner.invoke(
+        app,
+        [
+            "serve",
+            "--config",
+            str(path),
+            "--state-file",
+            str(tmp_path / "cli.json"),
+            "--server-name",
+            "two",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert captured[0].state_file == tmp_path / "cli.json"
     assert captured[0].server_name == "two"
     assert str(tmp_path / "cli.json") in result.output
     captured.clear()
-    assert runner.invoke(app, ["serve", "--config", str(path), "--server-name", "missing"]).exit_code != 0
+    assert (
+        runner.invoke(
+            app, ["serve", "--config", str(path), "--server-name", "missing"]
+        ).exit_code
+        != 0
+    )
     assert not captured
     help_text = unstyle(runner.invoke(app, ["serve", "--help"]).output)
     assert "--state-file" in help_text
@@ -451,17 +546,22 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
         config(server_name="missing")
 
 
-async def test_cancelled_state_save_finishes_before_next_rotation(manager, tmp_path, monkeypatch):
+async def test_cancelled_state_save_finishes_before_next_rotation(
+    manager, tmp_path, monkeypatch
+):
     import threading
     from tunnel_switch.state import save_last_server
+
     entered, release = threading.Event(), threading.Event()
     path = tmp_path / "state.json"
     manager.config.state_file = path
+
     def slow_save(*args):
         entered.set()
         if not release.wait(5):
             raise TimeoutError("Test did not release state save")
         save_last_server(*args)
+
     monkeypatch.setattr("tunnel_switch.tunnel.save_last_server", slow_save)
     task = asyncio.create_task(manager.rotate())
     try:
@@ -516,12 +616,15 @@ def test_state_syncs_directory_after_replace(tmp_path, monkeypatch):
 
     events = []
     fsync, replace = os.fsync, os.replace
+
     def sync(fd):
         events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
         fsync(fd)
+
     def rename(source, target):
         events.append("replace")
         replace(source, target)
+
     monkeypatch.setattr("tunnel_switch.state.os.fsync", sync)
     monkeypatch.setattr("tunnel_switch.state.os.replace", rename)
     save_last_server(tmp_path / "state.json", config().servers[0])
@@ -536,11 +639,13 @@ def test_state_directory_sync_failure_closes_handle(tmp_path, monkeypatch):
 
     fsync = os.fsync
     directories = []
+
     def sync(fd):
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             directories.append(fd)
             raise OSError("directory sync failed")
         fsync(fd)
+
     monkeypatch.setattr("tunnel_switch.state.os.fsync", sync)
     server = config().servers[0]
     with pytest.raises(OSError, match="directory sync failed"):
@@ -552,7 +657,9 @@ def test_state_directory_sync_failure_closes_handle(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync")
-async def test_failed_directory_sync_restores_saved_selection(manager, tmp_path, monkeypatch):
+async def test_failed_directory_sync_restores_saved_selection(
+    manager, tmp_path, monkeypatch
+):
     import stat
     from tunnel_switch.state import load_last_server
 
@@ -561,10 +668,12 @@ async def test_failed_directory_sync_restores_saved_selection(manager, tmp_path,
     await manager.rotate()
     previous = path.read_bytes()
     fsync = os.fsync
+
     def sync(fd):
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             raise OSError("directory sync failed")
         fsync(fd)
+
     monkeypatch.setattr("tunnel_switch.state.os.fsync", sync)
     with pytest.raises(TunnelFailure, match="directory sync failed"):
         await manager.rotate()
@@ -589,17 +698,27 @@ def test_init_config_is_private_and_does_not_overwrite(tmp_path):
 
 
 @pytest.mark.parametrize("timeout_stage", ["connect", "read"])
-async def test_readiness_retries_after_transient_probe_timeout(monkeypatch, timeout_stage):
+async def test_readiness_retries_after_transient_probe_timeout(
+    monkeypatch, timeout_stage
+):
     from unittest.mock import Mock
 
     manager = TunnelManager(config(startup_timeout_seconds=2))
     manager.process = Process()
     reader = Mock()
-    reader.readexactly = AsyncMock(side_effect=[TimeoutError(), b"\x05\x00"] if timeout_stage == "read" else [b"\x05\x00"])
+    reader.readexactly = AsyncMock(
+        side_effect=[TimeoutError(), b"\x05\x00"]
+        if timeout_stage == "read"
+        else [b"\x05\x00"]
+    )
     writer = Mock()
     writer.drain = AsyncMock()
     writer.wait_closed = AsyncMock()
-    connections = [TimeoutError(), (reader, writer)] if timeout_stage == "connect" else [(reader, writer), (reader, writer)]
+    connections = (
+        [TimeoutError(), (reader, writer)]
+        if timeout_stage == "connect"
+        else [(reader, writer), (reader, writer)]
+    )
     open_connection = AsyncMock(side_effect=connections)
     monkeypatch.setattr(asyncio, "open_connection", open_connection)
 

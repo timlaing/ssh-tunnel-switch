@@ -21,7 +21,7 @@ Edit the SSH host aliases in the YAML. Verify host keys and key/agent authentica
 .venv/bin/tunnel-switch serve --config config.yaml
 ```
 
-Startup generates and saves an API token if needed and prints it to the console. Keep the configuration and logs private. By default the SOCKS5 listener is `127.0.0.1:1080`, the HTTP proxy is `127.0.0.1:8118`, and the REST API is `127.0.0.1:8765`.
+Startup generates and saves an API token if needed and prints it to the console. Keep the configuration and logs private. On an interactive terminal `serve` shows a live status panel while timestamped service and access logs are written to the log file (`logging.file`); when run under systemd the timestamped lines also reach the journal. By default the SOCKS5 listener is `127.0.0.1:1080`, the HTTP proxy is `127.0.0.1:8118`, and the REST API is `127.0.0.1:8765`.
 
 ## Use the proxy
 

@@ -23,6 +23,13 @@ api:
   port: 8765
   # Leave unset to generate and save a token on service startup.
   token: null
+# Timestamped service and HTTP access logs. On an interactive terminal the
+# console shows a live status panel and logs go to the file; when stdout is not
+# a terminal (e.g. systemd) plain timestamped lines also reach the journal.
+logging:
+  # Set null to disable file logging; relative paths are resolved beside this YAML.
+  file: ~/.config/ssh-tunnel-switch/tunnel-switch.log
+  level: INFO
 cooldown_seconds: 30
 startup_timeout_seconds: 15
 stop_timeout_seconds: 5

@@ -1,13 +1,35 @@
 from pathlib import Path
+from threading import Event, Thread
 from typing import Annotated
 import httpx
 import typer
 import uvicorn
 from .api import create_app
 from .config import ensure_api_token, load_config, resolve_state_file
+from .logs import configure_logging
+from .status import REFRESH_SECONDS, run_status_display
+from .tunnel import TunnelManager
 
-app = typer.Typer(no_args_is_help=True, help="Manage the SSH SOCKS tunnel rotation API.")
-ConfigOption = Annotated[Path | None, typer.Option("--config", "-c", help="YAML file; defaults to ~/.config/ssh-tunnel-switch/config.yaml, then ./config.yaml.")]
+app = typer.Typer(
+    no_args_is_help=True, help="Manage the SSH SOCKS tunnel rotation API."
+)
+
+
+def is_tty() -> bool:
+    """True when stdout is a terminal, enabling the live status display."""
+    import sys
+
+    return sys.stdout.isatty()
+
+
+ConfigOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--config",
+        "-c",
+        help="YAML file; defaults to ~/.config/ssh-tunnel-switch/config.yaml, then ./config.yaml.",
+    ),
+]
 
 
 def resolve_config(path: Path | None) -> Path:
@@ -22,17 +44,31 @@ def settings(path: Path | None):
     config = load_config(path)
     token = config.api.token
     if not token:
-        raise ValueError("API token is missing from YAML; start the service with serve to generate and save it")
+        raise ValueError(
+            "API token is missing from YAML; start the service with serve to generate and save it"
+        )
     return config, token
 
 
 @app.command("init-config")
-def init_config(output: Annotated[Path, typer.Option("--output", "-o", help="New configuration file; existing files are never overwritten.")] = Path("config.yaml")):
+def init_config(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="New configuration file; existing files are never overwritten.",
+        ),
+    ] = Path("config.yaml"),
+):
     """Write a private example configuration, then edit its SSH host aliases."""
     from importlib.resources import files
     import os
+
     output = output.expanduser()
-    content = files("tunnel_switch").joinpath("example.yaml").read_text(encoding="utf-8")
+    content = (
+        files("tunnel_switch").joinpath("example.yaml").read_text(encoding="utf-8")
+    )
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(content)
@@ -49,10 +85,20 @@ def validate(config: ConfigOption = None):
 @app.command()
 def serve(
     config: ConfigOption = None,
-    state_file: Annotated[Path | None, typer.Option(
-        "--state-file", help="Override the last-connected-server state file (relative paths use the current directory).")] = None,
-    server_name: Annotated[str | None, typer.Option(
-        "--server-name", help="Start at this configured server name instead of the saved server.")] = None,
+    state_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-file",
+            help="Override the last-connected-server state file (relative paths use the current directory).",
+        ),
+    ] = None,
+    server_name: Annotated[
+        str | None,
+        typer.Option(
+            "--server-name",
+            help="Start at this configured server name instead of the saved server.",
+        ),
+    ] = None,
 ):
     """Start the API and manage one SSH process; Ctrl-C stops the tunnel."""
     config = resolve_config(config)
@@ -61,7 +107,9 @@ def serve(
         cfg.state_file = resolve_state_file(state_file, cfg, config)
     if server_name is not None:
         if server_name not in {server.name for server in cfg.servers}:
-            raise ValueError(f"Unknown server name: {server_name}. Choose one of: {', '.join(server.name for server in cfg.servers)}")
+            raise ValueError(
+                f"Unknown server name: {server_name}. Choose one of: {', '.join(server.name for server in cfg.servers)}"
+            )
         cfg.server_name = server_name
     token = ensure_api_token(config, cfg)
     typer.echo(f"API token: {token}")
@@ -71,7 +119,41 @@ def serve(
         ip = str(cfg.http_proxy.ip)
         host = f"[{ip}]" if ":" in ip else ip
         typer.echo(f"HTTP proxy: http://{host}:{cfg.http_proxy.port}")
-    uvicorn.run(create_app(cfg, token), host=str(cfg.api.ip), port=cfg.api.port, workers=1)
+    log_file = configure_logging(cfg.logging, console=not is_tty())
+    if log_file is not None:
+        typer.echo(f"Log file: {log_file}")
+    manager = TunnelManager(cfg)
+    application = create_app(cfg, token, manager)
+    if is_tty():
+        # uvicorn keeps the main thread so Ctrl-C and SIGTERM still trigger its
+        # graceful shutdown (and the SSH process cleanup in the app lifespan);
+        # the status display owns the console from a daemon thread instead.
+        stop = Event()
+        display = Thread(
+            target=run_status_display,
+            args=(cfg, manager, log_file, stop),
+            daemon=True,
+        )
+        display.start()
+        try:
+            uvicorn.run(
+                application,
+                host=str(cfg.api.ip),
+                port=cfg.api.port,
+                workers=1,
+                log_config=None,
+            )
+        finally:
+            stop.set()
+            display.join(timeout=2 * REFRESH_SECONDS + 1)
+    else:
+        uvicorn.run(
+            application,
+            host=str(cfg.api.ip),
+            port=cfg.api.port,
+            workers=1,
+            log_config=None,
+        )
 
 
 def request(path: Path | None, method: str, endpoint: str):
@@ -82,10 +164,13 @@ def request(path: Path | None, method: str, endpoint: str):
     elif ip == "::":
         ip = "::1"
     host = f"[{ip}]" if ":" in ip else ip
-    response = httpx.request(method, f"http://{host}:{cfg.api.port}/{endpoint}",
-                             headers={"Authorization": f"Bearer {token}"},
-                             timeout=cfg.startup_timeout_seconds + cfg.stop_timeout_seconds + 5,
-                             trust_env=False)
+    response = httpx.request(
+        method,
+        f"http://{host}:{cfg.api.port}/{endpoint}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=cfg.startup_timeout_seconds + cfg.stop_timeout_seconds + 5,
+        trust_env=False,
+    )
     response.raise_for_status()
     typer.echo(response.text)
 
@@ -108,9 +193,11 @@ def main():
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
         import click
+
         ctx = click.Context(typer.main.get_command(app))
         from contextlib import redirect_stdout
         import sys
+
         with redirect_stdout(sys.stderr):
             typer.echo(ctx.get_help(), err=True)
         typer.echo("Use tunnel-switch COMMAND --help for command options.", err=True)
