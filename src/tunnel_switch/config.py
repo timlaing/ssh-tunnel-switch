@@ -159,8 +159,8 @@ def resolve_private_file(
         raise ValueError(
             f"{label} must differ from the YAML configuration and SSH identity files"
         )
-    if resolved.is_dir():
-        raise ValueError(f"{label} must be a file, not a directory")
+    if resolved.exists() and not resolved.is_file():
+        raise ValueError(f"{label} must be a regular file")
     return resolved
 
 

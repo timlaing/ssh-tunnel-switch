@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from threading import Event, Thread
 from typing import Annotated
@@ -119,7 +120,14 @@ def serve(
         ip = str(cfg.http_proxy.ip)
         host = f"[{ip}]" if ":" in ip else ip
         typer.echo(f"HTTP proxy: http://{host}:{cfg.http_proxy.port}")
-    log_file = configure_logging(cfg.logging, console=not is_tty())
+    # An interactive terminal keeps a WARNING+ console handler so failures that
+    # happen before (or behind) the status panel are still visible, even when
+    # file logging is disabled; headless runs get every record on stderr.
+    log_file = configure_logging(
+        cfg.logging,
+        console=True,
+        console_level=logging.WARNING if is_tty() else logging.INFO,
+    )
     if log_file is not None:
         typer.echo(f"Log file: {log_file}")
     manager = TunnelManager(cfg)

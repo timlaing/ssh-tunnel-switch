@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -53,7 +54,21 @@ def test_log_file_resolves_beside_yaml_and_is_protected(tmp_path):
     with pytest.raises(ValueError, match="must differ"):
         load_config(path)
     path.write_text("servers:\n  - host: one\nproxy: {}\nlogging:\n  file: .\n")
-    with pytest.raises(ValueError, match="must be a file"):
+    with pytest.raises(ValueError, match="must be a regular file"):
+        load_config(path)
+
+
+def test_log_file_may_not_be_a_fifo(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("FIFOs are unavailable on Windows")
+    path = tmp_path / "config.yaml"
+    fifo = tmp_path / "tunnel.log"
+    os.mkfifo(fifo)
+    path.write_text(
+        "servers:\n  - host: one\nproxy: {}\nlogging:\n  file: tunnel.log\n"
+    )
+    # A FIFO would block the logging thread on its first write for ever.
+    with pytest.raises(ValueError, match="must be a regular file"):
         load_config(path)
 
 
@@ -123,13 +138,17 @@ def test_rollover_creates_rotated_private_files(tmp_path, root_logging):
     handler = next(
         h for h in root_logging.handlers if getattr(h, "_tunnel_switch", False)
     )
-    for index in range(20):
+    # Shrink the threshold so emission alone triggers size-based rotation,
+    # exercising the behaviour configure_logging actually configures.
+    handler.maxBytes = 512
+    for index in range(60):
         logger.info("line %s padded to grow the file %s", index, "x" * 100)
     handler.flush()
-    handler.doRollover()
     rotated = tmp_path / "service.log.1"
     assert rotated.exists()
-    assert "line 19" in rotated.read_text()
+    assert "line" in rotated.read_text()
+    # Rotation keeps at most the three configured backups.
+    assert not (tmp_path / "service.log.4").exists()
     # The replacement file created by rotation stays private, and appends keep working.
     logger.info("after rollover")
     for owned in root_logging.handlers:
@@ -139,6 +158,55 @@ def test_rollover_creates_rotated_private_files(tmp_path, root_logging):
     if sys.platform != "win32":
         assert target.stat().st_mode & 0o777 == 0o600
         assert rotated.stat().st_mode & 0o777 == 0o600
+
+
+def test_private_handler_refuses_symlinked_log_path(tmp_path, root_logging):
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("requires O_NOFOLLOW")
+    protected = tmp_path / "protected.txt"
+    protected.write_text("secret material\n")
+    target = tmp_path / "service.log"
+    target.symlink_to(protected)
+    settings = config(logging={"file": target}).logging
+    configure_logging(settings, console=False)
+    # The handler reports the refusal instead of following the link, so log
+    # appends cannot be redirected onto a protected file.
+    logging.getLogger().info("must not reach the protected file")
+    for handler in root_logging.handlers:
+        if getattr(handler, "_tunnel_switch", False):
+            handler.flush()
+    assert protected.read_text() == "secret material\n"
+    assert target.is_symlink()
+
+
+def test_private_handler_refuses_shared_directory(tmp_path, root_logging, capsys):
+    if sys.platform == "win32":
+        pytest.skip("POSIX directory modes")
+    directory = tmp_path / "shared"
+    directory.mkdir()
+    directory.chmod(0o777)
+    settings = config(logging={"file": directory / "service.log"}).logging
+    configure_logging(settings, console=False)
+    logging.getLogger().info("must not be written to a shared directory")
+    # No file appears where other users could swap the log path, and the
+    # refusal is reported on stderr rather than raised into the service.
+    assert not (directory / "service.log").exists()
+    assert (
+        "log directory must not be group- or world-writable" in capsys.readouterr().err
+    )
+
+
+def test_configure_logging_console_level_filters_by_severity(
+    tmp_path, root_logging, capsys
+):
+    settings = config(logging={"file": None}).logging
+    configure_logging(settings, console=True, console_level=logging.WARNING)
+    logger = logging.getLogger()
+    logger.info("routine info hidden")
+    logger.warning("serious warning shown")
+    err = capsys.readouterr().err
+    assert "routine info hidden" not in err
+    assert "serious warning shown" in err
 
 
 def status():
@@ -216,7 +284,7 @@ def test_status_display_renders_until_stop_event(tmp_path):
     assert renders[0]["state"] == "disconnected"
 
 
-def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys):
+def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys, root_logging):
     from tunnel_switch.cli import serve
 
     path = tmp_path / "config.yaml"
@@ -248,10 +316,24 @@ def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys):
     assert runs[0]["log_config"] is None
     # serve() stops the display once uvicorn has shut down.
     assert seen["stop"].is_set()
-    assert "Log file:" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Log file:" in captured.out
+    # The console handler keeps warnings visible behind the status panel, while
+    # routine records are left to the log file.
+    console = [
+        h
+        for h in root_logging.handlers
+        if getattr(h, "_tunnel_switch", False)
+        and isinstance(h, logging.StreamHandler)
+        and not hasattr(h, "baseFilename")
+    ]
+    assert console
+    assert console[0].level == logging.WARNING
 
 
-def test_serve_without_tty_runs_uvicorn_and_skips_display(tmp_path, monkeypatch):
+def test_serve_without_tty_runs_uvicorn_and_skips_display(
+    tmp_path, monkeypatch, root_logging
+):
     from tunnel_switch.cli import serve
 
     path = tmp_path / "config.yaml"

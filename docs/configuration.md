@@ -63,11 +63,20 @@ file logging. `logging.level` filters the service and Uvicorn loggers; valid
 levels are `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`.
 
 On an interactive terminal, `serve` shows a live status panel (state, server,
-elapsed time, proxy addresses and the last error) instead of console log lines,
-and redirects log output to the file. When stdout is not a terminal — for
-example under systemd — plain timestamped lines also go to the journal and the
-status panel is not shown. The log path must differ from the YAML and
-explicitly configured identity files.
+elapsed time, proxy addresses and the last error) instead of console log lines:
+routine records reach only the file, while warnings and errors still print to
+stderr, so failures such as a port bind error remain visible even with
+`file: null`, where those warnings and errors are then the only recorded
+output. When stdout is not a terminal — for example under systemd — plain
+timestamped lines also go to the journal at the configured level and the status
+panel is not shown.
+
+The log path must differ from the YAML and explicitly configured identity files
+and must be a regular file (a directory or FIFO is rejected). At write time the
+log directory must not be group- or world-writable — a sticky directory such as
+`/tmp` is exempt — and the log file itself is opened without following symlinks,
+so an attacker with write access to the directory cannot redirect log appends
+onto protected files.
 
 ## Restart state and startup selection
 
