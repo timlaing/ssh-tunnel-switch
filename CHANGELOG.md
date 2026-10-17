@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-10-17
+
+- Show the SSH server name beside the connection ID in the `serve` status panel, rendered as `<id> (<server name>)`.
+- Publish the connection ID, start time and server name as one snapshot so the live status display cannot combine fields from different tunnel lifecycles.
+
 ## 1.1.0 — 2026-10-17
 
 - Add timestamps to every service and HTTP access log line and write them to a rotating, mode-0600 log file (`logging` YAML section with `file` and `level`).
