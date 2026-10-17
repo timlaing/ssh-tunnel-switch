@@ -19,7 +19,7 @@ sudo useradd --system --user-group --create-home \
 sudo install -d -m 0700 -o tunnel-switch -g tunnel-switch /etc/tunnel-switch
 sudo install -d -m 0700 -o tunnel-switch -g tunnel-switch /var/lib/tunnel-switch/.ssh
 sudo python3 -m venv /opt/tunnel-switch/.venv
-sudo /opt/tunnel-switch/.venv/bin/python -m pip install 'ssh-tunnel-switch==1.0.0'
+sudo /opt/tunnel-switch/.venv/bin/python -m pip install 'ssh-tunnel-switch==1.1.0'
 sudo install -m 0600 -o tunnel-switch -g tunnel-switch \
   /opt/tunnel-switch/examples/config.yaml /etc/tunnel-switch/config.yaml
 sudoedit /etc/tunnel-switch/config.yaml

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-10-17
 
 - Add timestamps to every service and HTTP access log line and write them to a rotating, mode-0600 log file (`logging` YAML section with `file` and `level`).
 - Show a live terminal status display when `serve` runs interactively, while warnings and errors still reach stderr; non-interactive runs keep plain timestamped console lines for the journal. Fixes #6.
