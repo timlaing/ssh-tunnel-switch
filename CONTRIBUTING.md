@@ -26,7 +26,7 @@ Explicit integration opt-in fails if required tools are missing. Tests create te
 
 `main` requires a pull request, one approving review, resolved discussions, signed commits, current passing CI and CodeQL checks. Approvals are dismissed after new commits; the latest push requires approval by someone other than its author. GitHub does not let the PR author approve their own PR. Bot comments do not count as approval unless the bot submits an approving review accepted by GitHub. Copilot approvals count only when both auto-approval and approval counting are enabled in GitHub Settings → Copilot → Code review; comments do not count. CodeRabbit is configured to approve only after its latest review is complete, comments are resolved and pre-merge checks pass. A maintainer can review PRs authored by another contributor; a PR authored by the sole maintainer needs a qualifying external reviewer.
 
-Use signed commits and squash merging. The branch rules block force pushes and deletion. The documented policy is stored in `.github/rulesets/`; changes to those JSON files must also be applied to GitHub. CODEOWNERS identifies the maintainer but does not add a second mandatory code-owner approval.
+Use signed commits and squash merging. The branch rules block force pushes and deletion. CODEOWNERS identifies the maintainer but does not add a second mandatory code-owner approval.
 
 ## Releases
 
