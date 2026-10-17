@@ -24,9 +24,10 @@ class TunnelManager:
     def __init__(self, config: Config):
         self.config = config
         self.process = None
-        self.connection_id = None
-        self.started_at = None
-        self.server_name = None
+        # (connection_id, started_at, server_name) published as one immutable
+        # snapshot: the status display thread reads it while rotate()/_stop()
+        # write, so a torn read would mix values from different lifecycles.
+        self._connection = None
         self.last_error = None
         remembered = next(
             (
@@ -45,17 +46,19 @@ class TunnelManager:
         self._last_rotation = None
 
     def status(self) -> dict:
-        alive = self.process is not None and self.process.returncode is None
+        process = self.process
+        alive = process is not None and process.returncode is None
         state = "connected" if alive else "disconnected"
         if self._busy:
             state = "rotating"
+        connection_id, started_at, server_name = self._connection or (None, None, None)
+        if not alive:
+            connection_id = started_at = server_name = None
         return {
             "state": state,
-            "connection_id": self.connection_id if alive else None,
-            "started_at": self.started_at.isoformat()
-            if alive and self.started_at
-            else None,
-            "server": self.server_name if alive else None,
+            "connection_id": connection_id,
+            "started_at": started_at.isoformat() if started_at else None,
+            "server": server_name,
             "proxy": self.config.proxy.model_dump(mode="json"),
             "last_error": self.last_error,
         }
@@ -112,7 +115,7 @@ class TunnelManager:
                     pass
                 await process.wait()
         self.process = None
-        self.connection_id = self.started_at = self.server_name = None
+        self._connection = None
 
     async def _ready(self):
         ip = str(self.config.proxy.ip)
@@ -174,9 +177,11 @@ class TunnelManager:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await self._wait_until_ready()
-            self.connection_id = str(uuid4())
-            self.started_at = datetime.now(timezone.utc)
-            self.server_name = server.name
+            self._connection = (
+                str(uuid4()),
+                datetime.now(timezone.utc),
+                server.name,
+            )
             await self._remember_server(server)
             logger.info(
                 "Tunnel connected to SSH server %s (%s)", server.name, server.host

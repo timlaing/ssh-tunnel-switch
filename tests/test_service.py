@@ -76,6 +76,22 @@ async def test_rotation_stops_old_and_changes_id(manager):
     await manager.close()
 
 
+async def test_status_reports_one_connection_snapshot(manager):
+    status = await manager.rotate()
+    assert status["connection_id"]
+    assert status["server"] == "one"
+    # The trio is published and cleared as one snapshot, so the status display
+    # thread can never read an ID paired with a missing server name.
+    manager.process.returncode = 255
+    dead = manager.status()
+    assert (dead["connection_id"], dead["server"], dead["started_at"]) == (
+        None,
+        None,
+        None,
+    )
+    await manager.close()
+
+
 async def test_concurrent_rotation_rejected(manager):
     entered, release = asyncio.Event(), asyncio.Event()
 
