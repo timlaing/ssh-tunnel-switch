@@ -41,7 +41,10 @@ def status_panel(config: Config, status: dict, log_file=None) -> Panel:
     table.add_row("State", f"[{STATE_STYLES.get(state, 'white')}]{state}[/]")
     server = status["server"] or "-"
     table.add_row("Server", server)
-    table.add_row("Connection", (status["connection_id"] or "-")[:8])
+    connection = (status["connection_id"] or "")[:8]
+    table.add_row(
+        "Connection", f"{connection} ({status['server']})" if connection else "-"
+    )
     started = status["started_at"] or "-"
     if status["started_at"]:
         started += f" (up {_elapsed(status['started_at'])})"

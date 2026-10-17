@@ -63,7 +63,8 @@ file logging. `logging.level` filters the service and Uvicorn loggers; valid
 levels are `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`.
 
 On an interactive terminal, `serve` shows a live status panel (state, server,
-elapsed time, proxy addresses and the last error) instead of console log lines:
+connection ID shown as `<id> (<server name>)`, elapsed time, proxy addresses
+and the last error) instead of console log lines:
 routine records reach only the file, while warnings and errors still print to
 stderr, so failures such as a port bind error remain visible even with
 `file: null`, where those warnings and errors are then the only recorded
