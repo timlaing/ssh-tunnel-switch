@@ -235,7 +235,7 @@ def test_status_panel_renders_state_server_and_error(tmp_path):
     text = rendered(cfg, status(), log_file)
     assert "connected" in text
     assert "one" in text
-    assert "9d7e9746" in text
+    assert "9d7e9746 (one)" in text
     assert "127.0.0.1:1080" in text
     assert "127.0.0.1:8118" in text
     assert log_file.name in text
