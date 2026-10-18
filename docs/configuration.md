@@ -185,9 +185,14 @@ The state path must differ from the YAML and explicitly configured identity file
 
 The `/status`, `/rotate` and `/reload` endpoints require `Authorization: Bearer <token>`. FastAPI interactive API docs are available at `/docs`.
 
+`tunnel-switch --version` prints the installed build's version without
+contacting the service; the same version answers in `GET /status` (`version`),
+in the status panel title and on the `serve` startup banner, so a running
+service can always be matched to the package that produced it.
+
 | Endpoint       | Result                                                                                                                                                                                                                     |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)                               |
+| `GET /status`  | Package version, state, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)              |
 | `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                             |
 | `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `refused`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file |
 
@@ -225,6 +230,7 @@ Example connected status:
   "proxy": { "ip": "127.0.0.1", "port": 1080 },
   "http_proxy": { "enabled": true, "ip": "127.0.0.1", "port": 8118 },
   "last_error": null,
+  "version": "1.2.0",
   "config_reload": {
     "watching": true,
     "path": "/etc/tunnel-switch/config.yaml",

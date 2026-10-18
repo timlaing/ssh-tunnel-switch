@@ -453,6 +453,12 @@ def test_status_panel_shows_feedback_and_the_key_footer():
     assert "Last reload" not in rendered(cfg)
 
 
+def test_status_panel_title_carries_the_version():
+    from tunnel_switch import __version__
+
+    assert f"SSH Tunnel Switch {__version__}" in rendered(config())
+
+
 def rendered(cfg, state=None, keys=False):
     from io import StringIO
     from rich.console import Console

@@ -5,6 +5,7 @@ import secrets
 import signal
 from typing import Callable, Sequence
 from fastapi import Depends, FastAPI, Header, HTTPException
+from . import __version__
 from .config import Config
 from .http_proxy import HTTPProxyServer
 from .reload import ConfigReloader, ReloadOutcome
@@ -123,6 +124,9 @@ def _register_routes(app, manager, authorize, config_path, watch):
         current = app.state.config
         return {
             **manager.status(),
+            # Which build answers: the CLI flag, the panel title and this
+            # field all read the same distribution metadata.
+            "version": __version__,
             "http_proxy": {
                 "enabled": current.http_proxy.enabled,
                 "ip": str(current.http_proxy.ip),

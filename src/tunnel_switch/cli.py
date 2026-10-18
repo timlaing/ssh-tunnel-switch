@@ -7,6 +7,7 @@ from typing import Annotated
 import httpx
 import typer
 import uvicorn
+from . import __version__
 from .api import create_app
 from .config import ensure_api_token, load_config, resolve_state_file
 from .logs import configure_logging
@@ -16,6 +17,25 @@ from .tunnel import RotationRejected, TunnelManager
 app = typer.Typer(
     no_args_is_help=True, help="Manage the SSH SOCKS tunnel rotation API."
 )
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"tunnel-switch {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def root(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the version of this tunnel-switch build and exit.",
+    ),
+) -> None:
+    """Manage the SSH SOCKS tunnel rotation API."""
 
 
 def is_tty() -> bool:
@@ -226,6 +246,7 @@ def _apply_startup_overrides(cfg, config, state_file, server_name):
 
 
 def _echo_startup(cfg, token, log_file):
+    typer.echo(f"Version: {__version__}")
     typer.echo(f"API token: {token}")
     if cfg.state_file is not None:
         typer.echo(f"State file: {cfg.state_file}")
