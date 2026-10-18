@@ -256,6 +256,46 @@ async def test_unchanged_reload_clears_a_stale_error(yaml_file):
     await manager.close()
 
 
+async def test_concurrent_reloads_run_one_at_a_time(yaml_file, manager, monkeypatch):
+    """A queued reload waits for the running one, so neither applies a stale read."""
+    import itertools
+    from threading import Event
+
+    from tunnel_switch import reload as reload_module
+
+    real_load = reload_module.load_config
+    entered, release, calls = Event(), Event(), []
+    reads = itertools.count()
+
+    def ordered_load(path):
+        if next(reads) == 0:
+            entered.set()  # The first read holds the reload open.
+            release.wait(timeout=5)
+        calls.append(True)
+        return real_load(path)
+
+    monkeypatch.setattr(reload_module, "load_config", ordered_load)
+    reloader = ConfigReloader(yaml_file, load_config(yaml_file), targets=[manager])
+    yaml_file.write_text(document(cooldown_seconds=99))
+    first = asyncio.create_task(reloader.reload_now())
+    await until(lambda: entered.is_set())
+    second = asyncio.create_task(reloader.reload_now())
+    try:
+        await asyncio.sleep(0.1)
+        # The queued reload must not have read the file while the first
+        # reload still holds it: overlapping reads are what corrupts the
+        # signature-to-content match.
+        assert calls == []
+        release.set()
+        await asyncio.gather(first, second)
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+    assert calls == [True, True]  # Both ran, one after the other.
+    assert manager.config.cooldown_seconds == 99
+    await manager.close()
+
+
 async def test_poller_picks_up_a_changed_file(yaml_file):
     cfg = load_config(yaml_file)
     manager = TunnelManager(cfg)

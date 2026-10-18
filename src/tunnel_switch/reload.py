@@ -144,6 +144,11 @@ class ConfigReloader:
         self.last_error = None
         self.deferred: list[str] = []
         self.pending: Config | None = None
+        # The poller, POST /reload, SIGHUP and the status-panel key all call
+        # reload_now(): overlapping file reads could apply out of order and
+        # leave the signature describing a revision the running config never
+        # loaded, so exactly one reload runs at a time.
+        self._reload_lock = asyncio.Lock()
         self._signature = self._signature_now()
 
     def _signature_now(self) -> tuple[int, int, int] | None:
@@ -175,7 +180,17 @@ class ConfigReloader:
                 self._signature = previous
 
     async def reload_now(self) -> ReloadOutcome:
-        """Validate the file and apply every change that needs no rebind."""
+        """Validate the file and apply every change that needs no rebind.
+
+        Reload attempts are serialised: the second caller waits for the first
+        and then reads the file itself, so no task can apply a stale read over
+        a newer one.
+        """
+        async with self._reload_lock:
+            return await self._reload()
+
+    async def _reload(self) -> ReloadOutcome:
+        """Load and apply one configuration; callers hold the reload lock."""
         if self.busy is not None and self.busy():
             return self._refused()
         try:
