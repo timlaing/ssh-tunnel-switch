@@ -123,6 +123,88 @@ async def test_failure_cleans_process_and_cools_down(manager):
         await manager.rotate()
 
 
+def exited_ssh(code=255):
+    """A spawned ssh that failed to connect and exited, as ssh always does."""
+    process = Process()
+    process.returncode = code
+    return process
+
+
+async def test_ssh_connection_failure_advances_to_the_next_server(manager, monkeypatch):
+    # The first target dies (auth/host key/unreachable): one rotate() call must
+    # reach the working server, with no cooldown waited out in between.
+    manager.config.cooldown_seconds = 30
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), Process()]),
+    )
+    status = await manager.rotate()
+    assert status["server"] == "two"
+    assert status["state"] == "connected"
+    assert manager.last_error is None
+    # The cooldown gates the next rotate(), not the failover within this one.
+    with pytest.raises(RotationRejected, match="cooldown"):
+        await manager.rotate()
+    await manager.close()
+
+
+async def test_failover_wraps_past_the_end_of_the_list(manager, monkeypatch):
+    # The last server in the list refuses SSH: the rotation carries on around
+    # to the first server instead of failing at the end of the list.
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[Process(), exited_ssh(), Process()]),
+    )
+    assert (await manager.rotate())["server"] == "one"
+    status = await manager.rotate()
+    assert status["server"] == "one"
+    assert manager.last_error is None
+    await manager.close()
+
+
+async def test_rotation_reports_last_failure_when_every_server_fails(
+    manager, monkeypatch
+):
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), exited_ssh()]),
+    )
+    with pytest.raises(TunnelFailure, match="SSH exited with code 255"):
+        await manager.rotate()
+    status = manager.status()
+    assert status["state"] == "disconnected"
+    assert status["connection_id"] is None
+    assert (
+        manager.last_error
+        == "SSH exited with code 255; check authentication, known_hosts and forwarding permissions"
+    )
+    assert manager.process is None
+    await manager.close()
+
+
+async def test_api_returns_503_when_no_server_accepts_ssh(manager, monkeypatch):
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), exited_ssh()]),
+    )
+    app = create_app(manager.config, "secret", manager)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        headers = {"Authorization": "Bearer secret"}
+        response = await client.post("/rotate", headers=headers)
+        assert response.status_code == 503
+        assert "SSH exited with code 255" in response.json()["detail"]
+        assert (await client.get("/status", headers=headers)).json()["state"] == (
+            "disconnected"
+        )
+    await manager.close()
+
+
 async def test_cancelled_rotation_cleans_up(manager):
     entered = asyncio.Event()
 
