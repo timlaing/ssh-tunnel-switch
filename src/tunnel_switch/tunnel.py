@@ -164,55 +164,114 @@ class TunnelManager:
                 )
         self._busy = True
         self.last_error = None
-        # Select the target server first so every failure names it in the log.
-        self._index = (self._index + 1) % len(self.config.servers)
-        server = self.config.servers[self._index]
         try:
-            await self._stop()
-            self._ensure_socket_free()
-            self.process = await asyncio.create_subprocess_exec(
-                *self.command(server),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await self._wait_until_ready()
-            self._connection = (
-                str(uuid4()),
-                datetime.now(timezone.utc),
-                server.name,
-            )
-            await self._remember_server(server)
-            logger.info(
-                "Tunnel connected to SSH server %s (%s)", server.name, server.host
-            )
-        except asyncio.CancelledError:
-            await self._stop()
-            raise
-        except Exception as exc:
-            self.last_error = str(exc)
-            logger.exception("Tunnel rotation to server %s failed", server.name)
-            await self._stop()
-            raise TunnelFailure(str(exc)) from exc
+            await self._rotate_across_servers()
         finally:
             self._last_rotation = time.monotonic()
             self._busy = False
         return self.status()
 
+    async def _rotate_across_servers(self) -> None:
+        """Connect through the next server and, if it fails, the rest of the list.
+
+        Each server is tried at most once and without any cooldown between
+        attempts, so an SSH connection failure falls through to the next server
+        immediately. A rotation either stops at the first server that accepts
+        SSH or, when every server is rejected, reports the last failure once.
+        """
+        servers = self.config.servers
+        failures = []
+        try:
+            for attempt in range(len(servers)):
+                # Select the target server first so every failure names it in the log.
+                self._index = (self._index + 1) % len(servers)
+                server = servers[self._index]
+                try:
+                    await self._connect(server)
+                except Exception as exc:
+                    failures.append((server.name, exc))
+                    if attempt + 1 < len(servers):
+                        logger.exception(
+                            "Tunnel rotation to server %s failed; trying the next server",
+                            server.name,
+                        )
+                    else:
+                        logger.exception(
+                            "Tunnel rotation to server %s failed", server.name
+                        )
+                    await self._stop()
+                    continue
+                self._connection = (
+                    str(uuid4()),
+                    datetime.now(timezone.utc),
+                    server.name,
+                )
+                # The tunnel is up: failing to persist the selection must not
+                # move on to another server, since the same state file would fail.
+                try:
+                    await self._remember_server(server)
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    logger.exception(
+                        "Tunnel connected to SSH server %s but saving its state failed",
+                        server.name,
+                    )
+                    await self._stop()
+                    raise TunnelFailure(str(exc)) from exc
+                logger.info(
+                    "Tunnel connected to SSH server %s (%s)", server.name, server.host
+                )
+                return
+            _, last = failures[-1]
+            self.last_error = str(last)
+            logger.error(
+                "Tunnel rotation failed on every server (%d tried): %s",
+                len(servers),
+                "; ".join(f"{name}: {error}" for name, error in failures),
+            )
+            raise TunnelFailure(str(last))
+        except asyncio.CancelledError:
+            # Cancellation during connect or state save must not leave a tunnel.
+            await self._stop()
+            raise
+
+    async def _connect(self, server: Server):
+        """Start SSH for *server* and wait until it proxies, or raise."""
+        await self._stop()
+        self._ensure_socket_free()
+        self.process = await asyncio.create_subprocess_exec(
+            *self.command(server),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await self._wait_until_ready()
+
     async def _wait_until_ready(self):
-        """Wait for SOCKS readiness and a stable SSH process within its deadline."""
+        """Wait for SOCKS readiness and a stable SSH process within its deadline.
+
+        An SSH connection failure (auth, host key, unreachable host) makes ssh
+        exit, which is reported as soon as it is seen rather than as a timeout:
+        rotate() turns the raised TunnelFailure into a failover to the next
+        server.
+        """
         deadline = time.monotonic() + self.config.startup_timeout_seconds
         while time.monotonic() < deadline:
-            if self.process.returncode is not None:
-                raise TunnelFailure(
-                    f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions"
-                )
+            self._raise_if_ssh_exited()
             if await self._ready():
                 await asyncio.sleep(0.05)
                 if self.process.returncode is None:
                     return
             await asyncio.sleep(0.1)
+        # ssh may have died just as the deadline passed; report the real cause.
+        self._raise_if_ssh_exited()
         raise TunnelFailure("SSH SOCKS startup timed out")
+
+    def _raise_if_ssh_exited(self):
+        if self.process.returncode is not None:
+            raise TunnelFailure(
+                f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions"
+            )
 
     async def _remember_server(self, server):
         """Finish atomic persistence before allowing any subsequent rotation."""

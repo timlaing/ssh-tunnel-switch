@@ -380,6 +380,41 @@ def test_manager_logs_rotation_outcome(tmp_path, root_logging):
     assert not successes
 
 
+def test_manager_logs_every_server_tried_before_giving_up(root_logging):
+    records = []
+
+    class Sink(logging.Handler):
+        _tunnel_switch = True
+
+        def emit(self, record):
+            records.append(record)
+
+    root_logging.addHandler(Sink())
+    settings = config(
+        servers=[
+            {"name": "one", "host": "one.example", "user": "tunnel"},
+            {"name": "two", "host": "two.example", "user": "tunnel"},
+        ]
+    )
+    manager = TunnelManager(settings)
+    with pytest.raises(TunnelFailure, match="no route to host"):
+        asyncio_run_rotation(manager)
+    failures = [
+        record.getMessage() for record in records if "failed" in record.getMessage()
+    ]
+    # The skipped server is named as it is abandoned, then every attempt is
+    # summarised once so the log shows exactly what was tried and why.
+    assert failures[0].startswith(
+        "Tunnel rotation to server one failed; trying the next server"
+    )
+    assert failures[1].startswith("Tunnel rotation to server two failed")
+    assert failures[2] == (
+        "Tunnel rotation failed on every server (2 tried): "
+        "one: no route to host; two: no route to host"
+    )
+    assert not [message for message in failures if "connected to" in message]
+
+
 def asyncio_run_rotation(manager):
     import asyncio
 

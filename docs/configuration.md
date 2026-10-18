@@ -117,8 +117,9 @@ in YAML to opt out. `--state-file` overrides that opt-out.
 
 State is written only after SSH readiness succeeds, using atomic replacement and
 mode 0600. Parent directories are created as needed; the service account needs
-write access there. Failed SSH attempts leave the previous saved selection intact.
-A persistence failure fails that rotation and closes its new SSH process rather
+write access there. Failed SSH attempts leave the previous saved selection intact,
+and a rotation that falls through to a later server saves the one that actually
+connected. A persistence failure fails that rotation and closes its new SSH process rather
 than reporting an unremembered success. Shutdown preserves the file. It contains
 only a format version, server name and host, with no API token or private key.
 The state path must differ from the YAML and explicitly configured identity files.
@@ -127,12 +128,12 @@ The state path must differ from the YAML and explicitly configured identity file
 
 The `/status` and `/rotate` endpoints require `Authorization: Bearer <token>`. FastAPI interactive API docs are available at `/docs`.
 
-| Endpoint       | Result                                                                                   |
-| -------------- | ---------------------------------------------------------------------------------------- |
-| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, and last error |
-| `POST /rotate` | Stops current tunnel, starts next server, returns status after readiness                 |
+| Endpoint       | Result                                                                                                                                                         |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, and last error                                                                       |
+| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness |
 
-Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. Startup/SSH failures return **503** and leave the service disconnected; another trigger after the cooldown advances to the next server. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
+Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
 
 ```sh
 .venv/bin/tunnel-switch status --config config.yaml

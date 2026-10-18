@@ -1,4 +1,5 @@
 """Opt-in real OpenSSH tests; Docker fixtures never use personal SSH credentials."""
+
 import asyncio
 import os
 from pathlib import Path
@@ -17,8 +18,9 @@ pytestmark = pytest.mark.ssh_integration
 
 
 def docker(*args, timeout=60):
-    return subprocess.run(["docker", *args], check=True, capture_output=True,
-                          text=True, timeout=timeout).stdout.strip()
+    return subprocess.run(
+        ["docker", *args], check=True, capture_output=True, text=True, timeout=timeout
+    ).stdout.strip()
 
 
 def free_port():
@@ -50,32 +52,61 @@ def ssh_servers(tmp_path_factory):
     docker("info", "--format", "{{.ServerVersion}}")
     directory = tmp_path_factory.mktemp("real-ssh")
     key = directory / "identity"
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True
+    )
     image = f"tunnel-switch-test:{uuid4().hex}"
     containers = []
     image_ready = False
     try:
-        docker("build", "-q", "-t", image, str(Path(__file__).parent / "fixtures/ssh"), timeout=300)
+        docker(
+            "build",
+            "-q",
+            "-t",
+            image,
+            str(Path(__file__).parent / "fixtures/ssh"),
+            timeout=300,
+        )
         image_ready = True
         records = []
         for name in ("one", "two"):
-            container = docker("run", "-d", "--label", "tunnel-switch.integration=true",
-                               "-p", "127.0.0.1::22", "-e", f"TUNNEL_TEST_NAME={name}", image)
+            container = docker(
+                "run",
+                "-d",
+                "--label",
+                "tunnel-switch.integration=true",
+                "-p",
+                "127.0.0.1::22",
+                "-e",
+                f"TUNNEL_TEST_NAME={name}",
+                image,
+            )
             containers.append(container)
-            docker("cp", str(key.with_suffix(".pub")), f"{container}:/tmp/test_authorized_keys")
+            docker(
+                "cp",
+                str(key.with_suffix(".pub")),
+                f"{container}:/tmp/test_authorized_keys",
+            )
             port = int(docker("port", container, "22/tcp").rsplit(":", 1)[1])
             wait_for_ssh(port)
             public = docker("exec", container, "cat", "/tmp/ssh_host_ed25519_key.pub")
-            records.append({"name": name, "port": port, "public": public, "container": container})
+            records.append(
+                {"name": name, "port": port, "public": public, "container": container}
+            )
         known_hosts = directory / "known_hosts"
-        known_hosts.write_text("".join(f"[127.0.0.1]:{r['port']} {r['public']}\n" for r in records))
+        known_hosts.write_text(
+            "".join(f"[127.0.0.1]:{r['port']} {r['public']}\n" for r in records)
+        )
         ssh_config = directory / "ssh_config"
-        ssh_config.write_text("".join(
-            f"Host {r['name']}\n  HostName 127.0.0.1\n  Port {r['port']}\n"
-            f"  User tunnel\n  IdentityFile {key}\n  IdentitiesOnly yes\n"
-            f"  IdentityAgent none\n  UserKnownHostsFile {known_hosts}\n"
-            "  GlobalKnownHostsFile /dev/null\n"
-            for r in records))
+        ssh_config.write_text(
+            "".join(
+                f"Host {r['name']}\n  HostName 127.0.0.1\n  Port {r['port']}\n"
+                f"  User tunnel\n  IdentityFile {key}\n  IdentitiesOnly yes\n"
+                f"  IdentityAgent none\n  UserKnownHostsFile {known_hosts}\n"
+                "  GlobalKnownHostsFile /dev/null\n"
+                for r in records
+            )
+        )
         yield ssh_config, known_hosts, records
     finally:
         # Remove only resources owned by this fixture, including after failed setup.
@@ -96,21 +127,32 @@ def ssh_servers(tmp_path_factory):
 
 def manager_for(ssh_servers, monkeypatch):
     ssh_config, _, _ = ssh_servers
-    cfg = Config.model_validate({
-        "servers": [{"host": "one"}, {"host": "two"}],
-        "proxy": {"ip": "127.0.0.1", "port": free_port()},
-        "http_proxy": {"enabled": False}, "state_file": None, "cooldown_seconds": 0,
-        "startup_timeout_seconds": 5, "stop_timeout_seconds": 2,
-    })
+    cfg = Config.model_validate(
+        {
+            "servers": [{"host": "one"}, {"host": "two"}],
+            "proxy": {"ip": "127.0.0.1", "port": free_port()},
+            "http_proxy": {"enabled": False},
+            "state_file": None,
+            "cooldown_seconds": 0,
+            "startup_timeout_seconds": 5,
+            "stop_timeout_seconds": 2,
+        }
+    )
     manager = TunnelManager(cfg)
     command = manager.command
     # Run the production OpenSSH command, isolating only its config file from ~/.ssh.
-    monkeypatch.setattr(manager, "command", lambda server: ["ssh", "-F", str(ssh_config), *command(server)[1:]])
+    monkeypatch.setattr(
+        manager,
+        "command",
+        lambda server: ["ssh", "-F", str(ssh_config), *command(server)[1:]],
+    )
     return manager
 
 
 async def forwarded_body(manager):
-    reader, writer = await asyncio.open_connection("127.0.0.1", manager.config.proxy.port)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", manager.config.proxy.port
+    )
     try:
         writer.write(b"\x05\x01\x00")
         await writer.drain()
@@ -157,22 +199,44 @@ async def test_real_ssh_rotation_forwarding_and_cleanup(ssh_servers, monkeypatch
         sock.bind(("127.0.0.1", manager.config.proxy.port))
 
 
-async def test_real_ssh_rejects_unknown_host_then_recovers(ssh_servers, monkeypatch):
+async def test_real_ssh_falls_through_to_the_trusted_server(ssh_servers, monkeypatch):
     _, known_hosts, records = ssh_servers
     original = known_hosts.read_text()
     # Trust only server two: server one's key must be rejected, never accepted.
     known_hosts.write_text(f"[127.0.0.1]:{records[1]['port']} {records[1]['public']}\n")
     manager = manager_for(ssh_servers, monkeypatch)
     try:
-        with pytest.raises(TunnelFailure, match="SSH exited"):
-            await manager.rotate()
-        assert manager.process is None
-        assert manager.status()["connection_id"] is None
-        assert (await manager.rotate())["server"] == "two"
+        # One rotation: ssh for server one dies on the host key check and the
+        # rotation moves straight on to server two without waiting for a trigger.
+        status = await manager.rotate()
+        assert status["server"] == "two"
+        assert status["state"] == "connected"
+        assert manager.last_error is None
         assert await asyncio.wait_for(forwarded_body(manager), 5) == b"two"
     finally:
         await manager.close()
         known_hosts.write_text(original)
+
+
+async def test_real_ssh_reports_failure_when_every_host_is_rejected(
+    ssh_servers, monkeypatch
+):
+    _, known_hosts, records = ssh_servers
+    original = known_hosts.read_text()
+    known_hosts.write_text("")
+    manager = manager_for(ssh_servers, monkeypatch)
+    try:
+        with pytest.raises(TunnelFailure, match="SSH exited"):
+            await manager.rotate()
+        assert manager.process is None
+        assert manager.status()["connection_id"] is None
+        assert "SSH exited with code" in manager.last_error
+        # Trusting the servers again lets the next rotation recover.
+        known_hosts.write_text(original)
+        assert (await manager.rotate())["server"] == "one"
+        assert await asyncio.wait_for(forwarded_body(manager), 5) == b"one"
+    finally:
+        await manager.close()
 
 
 async def test_real_ssh_server_loss_and_recovery(ssh_servers, monkeypatch):
