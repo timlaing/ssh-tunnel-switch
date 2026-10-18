@@ -128,8 +128,20 @@ Before upgrading, preserve a protected copy of the configuration and current
 release bundle. Stop the service, extract the approved new release and install
 its wheel into the existing virtual environment, validate YAML as the service
 account, then start it and verify status. Restore the previous bundle and wheel
-and configuration if validation fails. Changing YAML requires a service restart;
-changing HTTP proxy settings also requires updating clients.
+and configuration if validation fails.
+
+Configuration changes no longer require a service restart: the service watches
+its YAML and applies them without dropping the tunnel, and `systemctl reload
+tunnel-switch` triggers the same reload immediately through the unit's
+`ExecReload` SIGHUP. Servers, timeouts, the API token and logging changes take
+effect at once; a changed `proxy` socket is adopted by the next rotation; the
+API and HTTP proxy listen addresses are created at startup and still need a
+restart, which the log and `config_reload.deferred` in `/status` name. Changing
+HTTP proxy settings also requires updating clients.
+
+Start the unit with `systemctl start` after an upgrade, or `systemctl reload
+tunnel-switch` after a configuration-only change, and confirm `/status` shows
+the expected server with no `config_reload.last_error`.
 
 The unit restarts a failed Python process. An SSH subprocess exiting while the
 API stays alive does not trigger a systemd restart; use `/status`, diagnose SSH,

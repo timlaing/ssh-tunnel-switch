@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
 from typing import Annotated
@@ -8,8 +10,8 @@ import uvicorn
 from .api import create_app
 from .config import ensure_api_token, load_config, resolve_state_file
 from .logs import configure_logging
-from .status import REFRESH_SECONDS, run_status_display
-from .tunnel import TunnelManager
+from .status import PanelState, REFRESH_SECONDS, run_status_display
+from .tunnel import RotationRejected, TunnelManager
 
 app = typer.Typer(
     no_args_is_help=True, help="Manage the SSH SOCKS tunnel rotation API."
@@ -83,6 +85,79 @@ def validate(config: ConfigOption = None):
     typer.echo("Configuration valid")
 
 
+def key_actions(application, manager, panel_state):
+    """Build the display-thread callbacks that run coroutines on the API loop.
+
+    The display thread cannot await, so each key schedules its coroutine on the
+    service event loop and records the outcome (or the rejection, such as an
+    active cooldown) as the panel's last action.
+    """
+
+    def submit(name, run):
+        def dispatch():
+            loop = getattr(application.state, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            future = asyncio.run_coroutine_threadsafe(run(), loop)
+
+            def done(completed):
+                try:
+                    panel_state.last_action = completed.result()
+                except RotationRejected as exc:
+                    panel_state.last_action = (
+                        f"{name}: {exc} (retry in {exc.retry_after}s)"
+                    )
+                except Exception as exc:
+                    panel_state.last_action = f"{name}: {exc}"
+
+            future.add_done_callback(done)
+
+        return dispatch
+
+    def apply_pending():
+        reloader = getattr(application.state, "reloader", None)
+        if reloader is not None:
+            # A new ssh process rebinds the SOCKS socket, so a deferred bind
+            # becomes live on every connection change.
+            reloader.apply_pending_binds()
+
+    async def reload_config():
+        reloader = getattr(application.state, "reloader", None)
+        if reloader is None:
+            return "reload: no configuration file was given to the service"
+        return f"reload: {(await reloader.reload_now()).summary()}"
+
+    async def connect():
+        status = manager.status()
+        if status["state"] == "connected":
+            return f"already connected to {status['server']}; Alt+R restarts it"
+        apply_pending()
+        await manager.restart()
+        return f"connect: tunnel up on {manager.status()['server']}"
+
+    async def restart():
+        apply_pending()
+        await manager.restart()
+        return f"restart: {manager.status()['server']}"
+
+    async def rotate():
+        apply_pending()
+        await manager.rotate()
+        return f"rotate: {manager.status()['server']}"
+
+    async def disconnect():
+        await manager.disconnect()
+        return "disconnect: tunnel stopped"
+
+    return {
+        "reload": submit("reload", reload_config),
+        "connect": submit("connect", connect),
+        "disconnect": submit("disconnect", disconnect),
+        "restart": submit("restart", restart),
+        "rotate": submit("rotate", rotate),
+    }
+
+
 @app.command()
 def serve(
     config: ConfigOption = None,
@@ -100,8 +175,15 @@ def serve(
             help="Start at this configured server name instead of the saved server.",
         ),
     ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option(
+            "--watch/--no-watch",
+            help="Poll the YAML file and apply configuration changes without restarting.",
+        ),
+    ] = True,
 ):
-    """Start the API and manage one SSH process; Ctrl-C stops the tunnel."""
+    """Start the API and manage one SSH process; Ctrl-C stops the service."""
     config = resolve_config(config)
     cfg = load_config(config)
     if state_file is not None:
@@ -131,7 +213,36 @@ def serve(
     if log_file is not None:
         typer.echo(f"Log file: {log_file}")
     manager = TunnelManager(cfg)
-    application = create_app(cfg, token, manager)
+    panel_state = PanelState()
+
+    def reloaded(outcome):
+        """Feed the panel and reconfigure logging after every reload attempt."""
+        panel_state.last_reload = (
+            f"{datetime.now(timezone.utc):%H:%M:%S} {outcome.summary()}"
+        )
+        if outcome.applied and outcome.config is not None:
+            configure_logging(
+                outcome.config.logging,
+                console=True,
+                console_level=logging.WARNING if is_tty() else logging.INFO,
+            )
+
+    def prepare_overrides(desired):
+        """CLI overrides outlive a reload; the YAML values apply after a restart."""
+        if state_file is not None:
+            desired.state_file = cfg.state_file
+        if server_name is not None:
+            desired.server_name = server_name
+
+    application = create_app(
+        cfg,
+        token,
+        manager,
+        config_path=config,
+        watch=watch,
+        on_reload=[reloaded],
+        prepare=prepare_overrides,
+    )
     if is_tty():
         # uvicorn keeps the main thread so Ctrl-C and SIGTERM still trigger its
         # graceful shutdown (and the SSH process cleanup in the app lifespan);
@@ -139,7 +250,11 @@ def serve(
         stop = Event()
         display = Thread(
             target=run_status_display,
-            args=(cfg, manager, log_file, stop),
+            args=(manager, stop),
+            kwargs={
+                "actions": key_actions(application, manager, panel_state),
+                "state": panel_state,
+            },
             daemon=True,
         )
         display.start()

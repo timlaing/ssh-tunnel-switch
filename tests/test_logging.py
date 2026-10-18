@@ -220,19 +220,22 @@ def status():
     }
 
 
-def rendered(cfg, current, log_file=None):
+def rendered(cfg, current):
     from io import StringIO
     from rich.console import Console
 
     buffer = StringIO()
-    Console(file=buffer, width=100).print(status_panel(cfg, current, log_file))
+    Console(file=buffer, width=100).print(status_panel(cfg, current))
     return buffer.getvalue()
 
 
 def test_status_panel_renders_state_server_and_error(tmp_path):
-    cfg = config(http_proxy={"enabled": True, "port": 8118})
+    cfg = config(
+        http_proxy={"enabled": True, "port": 8118},
+        logging={"file": "/tmp/svc.log"},
+    )
     log_file = Path("/tmp/svc.log")
-    text = rendered(cfg, status(), log_file)
+    text = rendered(cfg, status())
     assert "connected" in text
     assert "one" in text
     assert "9d7e9746 (one)" in text
@@ -267,13 +270,8 @@ def test_status_display_renders_until_stop_event(tmp_path):
     stop = Event()
     thread = Thread(
         target=run_status_display,
-        args=(
-            config(),
-            manager,
-            tmp_path / "svc.log",
-            stop,
-            Console(file=StringIO(), width=100),
-        ),
+        args=(manager, stop),
+        kwargs={"console": Console(file=StringIO(), width=100)},
     )
     thread.start()
     stop.set()
@@ -302,15 +300,17 @@ def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys, root_l
     )
     monkeypatch.setattr(
         "tunnel_switch.cli.run_status_display",
-        lambda cfg, manager, log_file, stop: seen.update(
+        lambda manager, stop, **kwargs: seen.update(
             server=manager.status()["server"],
-            log=log_file,
+            log=manager.config.logging.file,
             state=manager.status()["state"],
             stop=stop,
+            actions=sorted(kwargs["actions"]),
         ),
     )
     serve(path)
     assert seen["log"] == tmp_path / "service.log"
+    assert seen["actions"] == ["connect", "disconnect", "reload", "restart", "rotate"]
     # uvicorn keeps the main thread while the display runs alongside it.
     assert len(runs) == 1
     assert runs[0]["log_config"] is None

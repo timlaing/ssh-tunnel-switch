@@ -45,6 +45,22 @@ class TunnelManager:
         self._busy = False
         self._last_rotation = None
 
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def _admit(self) -> None:
+        """Refuse a connection change while one runs or the cooldown holds."""
+        if self._busy:
+            raise RotationRejected("Tunnel rotation already in progress")
+        now = time.monotonic()
+        if self._last_rotation is not None:
+            remaining = self.config.cooldown_seconds - (now - self._last_rotation)
+            if remaining > 0:
+                raise RotationRejected(
+                    "Tunnel rotation cooldown active", int(remaining) + 1
+                )
+
     def status(self) -> dict:
         process = self.process
         alive = process is not None and process.returncode is None
@@ -152,34 +168,60 @@ class TunnelManager:
                 ) from exc
 
     async def rotate(self) -> dict:
+        """Connect through the next server, falling back to the rest of the list."""
         # No await before admission: atomic within the single service event loop.
+        self._admit()
+        return await self._change(self._rotate_across_servers)
+
+    async def restart(self) -> dict:
+        """Reconnect to the server the rotation index currently names.
+
+        The index is pinned instead of advanced, so a restart bounces the
+        current server; if it refuses SSH, the same failover as rotate() runs.
+        """
+        self._admit()
+        first = self._index if self._index >= 0 else 0
+        return await self._change(
+            lambda: self._rotate_across_servers(first_index=first)
+        )
+
+    async def disconnect(self) -> dict:
+        """Stop the tunnel without connecting elsewhere.
+
+        Stopping never contacts an SSH server, so it also clears the cooldown
+        gate: a subsequent restart() or rotate() reconnects immediately.
+        """
         if self._busy:
             raise RotationRejected("Tunnel rotation already in progress")
-        now = time.monotonic()
-        if self._last_rotation is not None:
-            remaining = self.config.cooldown_seconds - (now - self._last_rotation)
-            if remaining > 0:
-                raise RotationRejected(
-                    "Tunnel rotation cooldown active", int(remaining) + 1
-                )
+        await self._stop()
+        self._last_rotation = None
+        logger.info("Tunnel disconnected")
+        return self.status()
+
+    async def _change(self, connect) -> dict:
         self._busy = True
         self.last_error = None
         try:
-            await self._rotate_across_servers()
+            await connect()
         finally:
             self._last_rotation = time.monotonic()
             self._busy = False
         return self.status()
 
-    async def _rotate_across_servers(self) -> None:
+    async def _rotate_across_servers(self, first_index: int | None = None) -> None:
         """Connect through the next server and, if it fails, the rest of the list.
 
         Each server is tried at most once and without any cooldown between
         attempts, so an SSH connection failure falls through to the next server
         immediately. A rotation either stops at the first server that accepts
         SSH or, when every server is rejected, reports the last failure once.
+        ``first_index`` pins the first server tried; by default the rotation
+        advances from the current one.
         """
         servers = self.config.servers
+        if first_index is None:
+            first_index = (self._index + 1) % len(servers)
+        self._index = (first_index - 1) % len(servers)
         failures = []
         try:
             for attempt in range(len(servers)):

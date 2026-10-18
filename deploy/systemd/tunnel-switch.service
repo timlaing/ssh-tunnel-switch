@@ -11,6 +11,7 @@ User=tunnel-switch
 Group=tunnel-switch
 WorkingDirectory=/var/lib/tunnel-switch
 ExecStart=/opt/tunnel-switch/.venv/bin/tunnel-switch serve --config /etc/tunnel-switch/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

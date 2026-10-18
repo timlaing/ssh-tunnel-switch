@@ -46,7 +46,47 @@ precedence. Invalid or unreadable files report an error without falling back.
 
 No token environment variable is used. `status` and `rotate` read the saved YAML token; they do not generate one. `serve` resumes the saved SSH server unless `start_on_launch: false`; without saved state it starts the first server. Ctrl-C cleans up its SSH process. Each command supports `--help`; command/configuration/network failures print an error and CLI help with a nonzero exit code.
 
-Run exactly one service process for a given SOCKS socket. The supplied CLI uses one Uvicorn worker, without reload. It manages only SSH processes it spawned. An existing process occupying the SOCKS address is rejected rather than terminated. The cooldown also applies after startup and failed rotations, so an immediate rotation within the default 30 seconds returns 429.
+Run exactly one service process for a given SOCKS socket. The supplied CLI uses one Uvicorn worker; its configuration is reloaded live (see below), not by restarting the worker. It manages only SSH processes it spawned. An existing process occupying the SOCKS address is rejected rather than terminated. The cooldown also applies after startup and failed rotations, so an immediate rotation within the default 30 seconds returns 429.
+
+## Reloading configuration
+
+`serve` watches the YAML file it was started with and applies changes without
+restarting, so the API stays up and the established SSH tunnel keeps running.
+Polling runs every two seconds and ignores a rewrite whose content is
+unchanged; `serve --no-watch` disables polling only, leaving the manual
+triggers below available.
+
+Reloads are triggered by the file watch, by `POST /reload`, or by `SIGHUP`
+(the supplied unit ships `ExecReload=/bin/kill -HUP $MAINPID`, so
+`systemctl reload tunnel-switch` works). A reload is refused while a rotation
+is in progress, so a rotation never sees a half-changed server list.
+
+The file is validated in full before anything is applied. If it is invalid —
+for example an unknown key or a missing identity file — the running
+configuration is kept, the failure is logged, and it is reported as
+`config_reload.last_error` in `GET /status`. A bad edit can therefore never
+stop the service or drop the tunnel. CLI startup overrides (`--state-file`,
+`--server-name`) outlive reloads for the life of the process.
+
+Applied immediately:
+
+- `servers` (used by the next rotation), `cooldown_seconds`,
+  `startup_timeout_seconds`, `stop_timeout_seconds`
+- `api.token`, so a rotated token takes effect on the next request
+- `state_file`, `logging.file` and `logging.level` (the log handlers are
+  rebuilt)
+- every `http_proxy` limit that is read per connection: the timeouts,
+  `header_limit_bytes` and `max_connections`
+
+Deferred, because they are baked into an already-bound socket, and named in
+`config_reload.deferred` as well as in the log:
+
+- `proxy.ip` and `proxy.port`: the running `ssh -D` keeps its socket, and the
+  new bind is adopted by the next connection change — `POST /rotate`, or the
+  Alt+R/Ctrl+N/Ctrl+E keys below
+- `api.ip` and `api.port`, and `http_proxy.enabled`, `http_proxy.ip` and
+  `http_proxy.port`: these listeners are only created at startup, so they
+  require a service restart. The HTTP proxy limits above still apply live.
 
 ## Logging and the status display
 
@@ -71,6 +111,23 @@ stderr, so failures such as a port bind error remain visible even with
 output. When stdout is not a terminal — for example under systemd — plain
 timestamped lines also go to the journal at the configured level and the status
 panel is not shown.
+
+When both stdout and stdin are terminals on a POSIX system, the panel also
+shows the last reload, the last key action and a key footer. Keys are read in
+cbreak mode, so Ctrl-C is untouched and still stops the service:
+
+| Key    | Action                                                                           |
+| ------ | -------------------------------------------------------------------------------- |
+| Ctrl+E | connect to the last server (a hint when already connected)                       |
+| Ctrl+D | stop the tunnel; this also clears the cooldown, so connecting again is immediate |
+| Alt+R  | reconnect to the current server                                                  |
+| Ctrl+N | rotate to the next server                                                        |
+| Ctrl+R | reload the configuration, as `POST /reload` does                                 |
+| Ctrl+C | stop the service (unchanged: SIGINT, normal uvicorn shutdown)                    |
+
+Each connection change goes through the same cooldown and busy checks as the
+API, and a rejection (for example an active cooldown) is reported in the
+panel's last-action row rather than lost.
 
 The log path must differ from the YAML and explicitly configured identity files
 and must be a regular file (a directory or FIFO is rejected). At write time the
@@ -126,20 +183,29 @@ The state path must differ from the YAML and explicitly configured identity file
 
 ## REST API and CLI
 
-The `/status` and `/rotate` endpoints require `Authorization: Bearer <token>`. FastAPI interactive API docs are available at `/docs`.
+The `/status`, `/rotate` and `/reload` endpoints require `Authorization: Bearer <token>`. FastAPI interactive API docs are available at `/docs`.
 
-| Endpoint       | Result                                                                                                                                                         |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, and last error                                                                       |
-| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness |
+| Endpoint       | Result                                                                                                                                                                                                          |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)                    |
+| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                  |
+| `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file |
 
 Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
+
+`POST /reload` returns **429** while a rotation is in progress, and **404** when
+the service was started without a configuration file; a YAML that fails
+validation is reported as `error` in a **200** response and as
+`config_reload.last_error` in `/status`, with the previous configuration kept.
+A rotation (`POST /rotate`) also adopts a `proxy` change that an earlier
+reload had to defer, since it creates a fresh `ssh` process.
 
 ```sh
 .venv/bin/tunnel-switch status --config config.yaml
 .venv/bin/tunnel-switch rotate --config config.yaml
 curl --noproxy '*' -H "Authorization: Bearer <token-from-YAML>" http://127.0.0.1:8765/status
 curl --noproxy '*' -X POST -H "Authorization: Bearer <token-from-YAML>" http://127.0.0.1:8765/rotate
+curl --noproxy '*' -X POST -H "Authorization: Bearer <token-from-YAML>" http://127.0.0.1:8765/reload
 ```
 
 Example connected status:
@@ -152,6 +218,13 @@ Example connected status:
   "server": "first",
   "proxy": { "ip": "127.0.0.1", "port": 1080 },
   "http_proxy": { "enabled": true, "ip": "127.0.0.1", "port": 8118 },
-  "last_error": null
+  "last_error": null,
+  "config_reload": {
+    "watching": true,
+    "path": "/etc/tunnel-switch/config.yaml",
+    "last_reload": "14:22:31 applied (3 servers)",
+    "last_error": null,
+    "deferred": []
+  }
 }
 ```

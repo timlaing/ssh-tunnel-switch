@@ -111,6 +111,70 @@ async def test_concurrent_rotation_rejected(manager):
     await manager.close()
 
 
+async def test_restart_reconnects_to_the_same_server(manager):
+    await manager.rotate()
+    await manager.rotate()
+    assert manager.status()["server"] == "two"
+    previous = manager.status()["connection_id"]
+    restarted = await manager.restart()
+    # The index is pinned, not advanced: a restart bounces the current server.
+    assert restarted["server"] == "two"
+    assert restarted["connection_id"] != previous
+    await manager.close()
+
+
+async def test_restart_without_a_previous_connection_uses_the_first_server(manager):
+    assert (await manager.restart())["server"] == "one"
+    await manager.close()
+
+
+async def test_restart_fails_over_when_the_current_server_refuses(manager, monkeypatch):
+    await manager.rotate()
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), Process()]),
+    )
+    status = await manager.restart()
+    # The pinned server is tried first, then the same failover as rotate().
+    assert status["server"] == "two"
+    assert manager.last_error is None
+    await manager.close()
+
+
+async def test_disconnect_stops_the_tunnel_and_clears_the_cooldown(manager):
+    manager.config.cooldown_seconds = 30
+    await manager.rotate()
+    process = manager.process
+    disconnected = await manager.disconnect()
+    assert process.terminated
+    assert disconnected["state"] == "disconnected"
+    assert disconnected["connection_id"] is None
+    # The cooldown gates connections; stopping never contacts a server, so a
+    # restart reconnects to the same server immediately.
+    assert (await manager.restart())["server"] == "one"
+    await manager.close()
+
+
+async def test_disconnect_is_rejected_while_a_rotation_runs(manager):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def ready():
+        entered.set()
+        await release.wait()
+        return True
+
+    manager._ready = ready
+    task = asyncio.create_task(manager.rotate())
+    await entered.wait()
+    with pytest.raises(RotationRejected, match="in progress"):
+        await manager.disconnect()
+    release.set()
+    await task
+    assert manager.status()["state"] == "connected"
+    await manager.close()
+
+
 async def test_failure_cleans_process_and_cools_down(manager):
     manager.config.cooldown_seconds = 30
     manager.config.startup_timeout_seconds = 0.01
@@ -609,7 +673,7 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
     captured = []
     monkeypatch.setattr(
         "tunnel_switch.cli.create_app",
-        lambda cfg, token, manager=None: captured.append(cfg) or object(),
+        lambda cfg, token, manager=None, **kwargs: captured.append(cfg) or object(),
     )
     monkeypatch.setattr("tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: None)
     runner = CliRunner()
