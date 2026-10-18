@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0 — 2026-10-18
+
+- Fail over to the next configured server within a single rotation when a server refuses SSH or never becomes ready, instead of ending the rotation and making the caller wait out the cooldown. Each server is tried at most once and the rotation stops at the first one that connects; if every server fails the request still returns 503 with the last failure in `last_error`, and the log names each attempt.
+- Report an SSH connection failure by its exit code even when ssh dies as the startup deadline passes, rather than as a generic startup timeout.
+
 ## 1.1.1 — 2026-10-17
 
 - Show the SSH server name beside the connection ID in the `serve` status panel, rendered as `<id> (<server name>)`.
