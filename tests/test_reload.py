@@ -677,6 +677,34 @@ async def test_rejected_rotation_keeps_the_running_bind(yaml_file, manager):
     await manager.close()
 
 
+async def test_reload_endpoint_429_when_a_rotation_starts_mid_read(
+    yaml_file, manager, monkeypatch
+):
+    """The entry gate cannot see a rotation that starts during the file read."""
+    from tunnel_switch import reload as reload_module
+
+    real_load = reload_module.load_config
+
+    def load_while_rotating(path):
+        manager._busy = True  # A rotation is admitted while the read runs.
+        return real_load(path)
+
+    monkeypatch.setattr(reload_module, "load_config", load_while_rotating)
+    app = create_app(manager.config, "secret", manager, config_path=yaml_file)
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yaml_file.write_text(document(cooldown_seconds=99))
+        response = await client.post("/reload", headers=headers)
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "1"
+    # A refused reload applies nothing, so the running configuration stands.
+    assert manager.config.cooldown_seconds == 0
+    manager._busy = False
+    await manager.close()
+
+
 async def test_signal_trigger_failure_keeps_the_poller_alive(yaml_file, manager):
     """The SIGHUP hook is best effort: a loop that refuses it changes nothing."""
     from types import SimpleNamespace as Namespace

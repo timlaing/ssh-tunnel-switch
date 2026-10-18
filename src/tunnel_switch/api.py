@@ -108,6 +108,15 @@ def _reload_status(app, config_path, watch):
     }
 
 
+def _rotation_in_progress() -> HTTPException:
+    """The 429 a reload hits whenever a rotation owns the manager."""
+    return HTTPException(
+        status_code=429,
+        detail="Tunnel rotation already in progress",
+        headers={"Retry-After": "1"},
+    )
+
+
 def _register_routes(app, manager, authorize, config_path, watch):
     @app.get("/status", dependencies=[Depends(authorize)])
     async def status():
@@ -164,12 +173,13 @@ def _register_routes(app, manager, authorize, config_path, watch):
                 status_code=404, detail="No configuration file was given to the service"
             )
         if manager.busy:
-            raise HTTPException(
-                status_code=429,
-                detail="Tunnel rotation already in progress",
-                headers={"Retry-After": "1"},
-            )
-        return (await reloader.reload_now()).payload()
+            raise _rotation_in_progress()
+        outcome = await reloader.reload_now()
+        if outcome.refused:
+            # The rotation began while the file was being read, past the entry
+            # gate above: callers get the same 429 retry contract either way.
+            raise _rotation_in_progress()
+        return outcome.payload()
 
 
 def create_app(

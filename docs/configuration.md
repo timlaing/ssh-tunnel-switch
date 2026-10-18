@@ -193,7 +193,9 @@ The `/status`, `/rotate` and `/reload` endpoints require `Authorization: Bearer 
 
 Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
 
-`POST /reload` returns **429** while a rotation is in progress, and **404** when
+`POST /reload` returns **429** while a rotation is in progress — including one
+that starts while the file is being validated, after the entry check passed —
+and **404** when
 the service was started without a configuration file; a YAML that fails
 validation is reported as `error` in a **200** response and as
 `config_reload.last_error` in `/status`, with the previous configuration kept.
