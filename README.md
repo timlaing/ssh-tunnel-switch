@@ -1,5 +1,25 @@
 # SSH Tunnel Switch
 
+[![CI](https://github.com/timlaing/ssh-tunnel-switch/actions/workflows/ci.yml/badge.svg)](https://github.com/timlaing/ssh-tunnel-switch/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/timlaing/ssh-tunnel-switch/actions/workflows/codeql.yml/badge.svg)](https://github.com/timlaing/ssh-tunnel-switch/actions/workflows/codeql.yml)
+[![PyPI](https://img.shields.io/pypi/v/ssh-tunnel-switch)](https://pypi.org/project/ssh-tunnel-switch/)
+[![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Ftimlaing%2Fssh-tunnel-switch%2Fmain%2Fpyproject.toml)](https://pypi.org/project/ssh-tunnel-switch/)
+[![License](https://img.shields.io/github/license/timlaing/ssh-tunnel-switch)](LICENSE)
+
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Duplicated Lines (%)](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=coverage)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=bugs)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=timlaing_ssh-tunnel-switch&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=timlaing_ssh-tunnel-switch)
+
 Rotate SSH SOCKS5 tunnels through a REST API or CLI. The built-in HTTP proxy forwards HTTP requests and HTTPS CONNECT traffic through the active tunnel, using SOCKS5 for remote DNS resolution.
 
 The server runs independently and requires Python 3.12+ and OpenSSH. No OpenCode, Node.js, Bun or plugin is required.
