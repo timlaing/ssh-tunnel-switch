@@ -737,6 +737,65 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
         config(server_name="missing")
 
 
+def test_version_flag_reports_the_package_version():
+    import tunnel_switch
+
+    result = CliRunner().invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == f"tunnel-switch {tunnel_switch.__version__}"
+
+
+def test_startup_echo_reports_the_version(capsys):
+    from tunnel_switch import __version__
+    from tunnel_switch.cli import _echo_startup
+
+    _echo_startup(config(), "token", None)
+    assert f"Version: {__version__}" in capsys.readouterr().out
+
+
+async def test_status_reports_the_package_version(manager):
+    import tunnel_switch
+
+    application = create_app(manager.config, "secret", manager)
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        payload = (await client.get("/status", headers=headers)).json()
+    assert payload["version"] == tunnel_switch.__version__
+    await manager.close()
+
+
+def test_package_version_falls_back_without_metadata(monkeypatch):
+    from importlib.metadata import PackageNotFoundError
+
+    import tunnel_switch
+
+    def missing(_name):
+        raise PackageNotFoundError(_name)
+
+    monkeypatch.setattr(tunnel_switch, "version", missing)
+    assert tunnel_switch._package_version() == "0+unknown"
+    monkeypatch.setattr(tunnel_switch, "version", lambda _name: "9.9.9")
+    assert tunnel_switch._package_version() == "9.9.9"
+
+
+def test_reported_version_matches_pyproject():
+    """A stale editable install reports an old build: refresh it if this fails."""
+    import tomllib
+
+    import tunnel_switch
+
+    if tunnel_switch.__version__ == "0+unknown":
+        pytest.skip("no distribution metadata (bare source tree)")
+    declared = tomllib.loads(
+        (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    )["project"]["version"]
+    assert tunnel_switch.__version__ == declared, (
+        "installed metadata is stale; refresh with `uv pip install -e .`"
+    )
+
+
 async def test_cancelled_state_save_finishes_before_next_rotation(
     manager, tmp_path, monkeypatch
 ):
