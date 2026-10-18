@@ -103,7 +103,8 @@ async def test_reload_applies_hot_fields_and_defers_binds(yaml_file):
         )
     )
     outcome = await reloader.reload_now()
-    assert outcome.applied and outcome.error is None
+    assert outcome.applied
+    assert outcome.error is None
     assert [server.name for server in manager.config.servers] == [
         "one",
         "two",
@@ -144,7 +145,8 @@ async def test_reload_keeps_running_config_when_yaml_is_invalid(yaml_file):
     )
     yaml_file.write_text("servers: []\n")
     outcome = await reloader.reload_now()
-    assert outcome.error and not outcome.applied
+    assert outcome.error
+    assert not outcome.applied
     assert [server.name for server in manager.config.servers] == ["one", "two"]
     # The failure is reported to /status and the panel, never raised at startup.
     assert reloader.last_error == outcome.error
@@ -158,7 +160,8 @@ async def test_reload_with_unchanged_content_is_not_applied(yaml_file):
     reloader = ConfigReloader(yaml_file, cfg, targets=[manager])
     yaml_file.write_text(document())  # A rewrite with nothing to apply.
     outcome = await reloader.reload_now()
-    assert outcome.unchanged and not outcome.applied
+    assert outcome.unchanged
+    assert not outcome.applied
     assert reloader.last_reload is None
     await manager.close()
 
@@ -253,7 +256,8 @@ async def test_reload_endpoint_reports_and_applies(yaml_file):
         response = await client.post("/reload", headers=headers)
         assert response.status_code == 200
         payload = response.json()
-        assert payload["applied"] and payload["servers"] == 1
+        assert payload["applied"]
+        assert payload["servers"] == 1
         assert payload["error"] is None
         status = (await client.get("/status", headers=headers)).json()
         assert status["config_reload"]["last_reload"]
@@ -434,3 +438,417 @@ async def test_restart_key_reports_the_remaining_cooldown(manager):
         "restart: Tunnel rotation cooldown active (retry in "
     )
     await manager.close()
+
+
+async def test_key_actions_run_and_feed_the_panel(manager):
+    """Every key reports its outcome, whatever the tunnel does."""
+    from tunnel_switch.cli import key_actions
+
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
+    )
+    panel = PanelState()
+    actions = key_actions(application, manager, panel)
+    expected = [
+        ("reload", "reload: no configuration file was given to the service"),
+        ("rotate", "rotate: one"),
+        ("restart", "restart: one"),
+        ("disconnect", "disconnect: tunnel stopped"),
+    ]
+    for name, message in expected:
+        panel.last_action = None
+        actions[name]()
+        await until(lambda: panel.last_action is not None)
+        assert panel.last_action == message
+    await manager.close()
+
+
+async def test_connection_key_adopts_a_pending_bind(yaml_file, manager):
+    """A key that creates ssh carries the deferred SOCKS bind with it."""
+    from tunnel_switch.cli import key_actions
+
+    reloader = ConfigReloader(yaml_file, manager.config, targets=[manager])
+    yaml_file.write_text(document(proxy={"ip": "127.0.0.1", "port": 1090}))
+    await reloader.reload_now()
+    assert manager.config.proxy.port == 1080
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=reloader)
+    )
+    panel = PanelState()
+    actions = key_actions(application, manager, panel)
+    actions["rotate"]()
+    await until(lambda: panel.last_action is not None)
+    assert panel.last_action == "rotate: one"
+    assert manager.config.proxy.port == 1090
+    assert reloader.pending is None
+    await manager.close()
+
+
+async def test_reload_key_reports_an_unchanged_file(yaml_file, manager):
+    from tunnel_switch.cli import key_actions
+
+    reloader = ConfigReloader(yaml_file, manager.config, targets=[manager])
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=reloader)
+    )
+    panel = PanelState()
+    actions = key_actions(application, manager, panel)
+    actions["reload"]()
+    await until(lambda: panel.last_action is not None)
+    assert panel.last_action == "reload: unchanged"
+    await manager.close()
+
+
+async def test_key_failure_is_shown_in_the_panel(manager):
+    from tunnel_switch.cli import key_actions
+
+    async def exploding_disconnect():
+        raise RuntimeError("tunnel exploded")
+
+    manager.disconnect = exploding_disconnect
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
+    )
+    panel = PanelState()
+    actions = key_actions(application, manager, panel)
+    actions["disconnect"]()
+    await until(lambda: panel.last_action is not None)
+    assert panel.last_action == "disconnect: tunnel exploded"
+    await manager.close()
+
+
+def test_key_without_a_loop_is_dropped():
+    from tunnel_switch.cli import key_actions
+
+    manager = TunnelManager(config())
+    panel = PanelState()
+    application = SimpleNamespace(state=SimpleNamespace(loop=None, reloader=None))
+    actions = key_actions(application, manager, panel)
+    # Before the lifespan runs there is nothing to schedule a coroutine on.
+    actions["disconnect"]()
+    assert panel.last_action is None
+
+
+def test_reload_feedback_updates_the_panel_and_logging(monkeypatch):
+    from pathlib import Path
+
+    from tunnel_switch.cli import _reload_feedback
+    from tunnel_switch.reload import ReloadOutcome
+
+    calls = []
+    monkeypatch.setattr(
+        "tunnel_switch.cli.configure_logging",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or Path("/tmp/x.log"),
+    )
+    panel = SimpleNamespace(last_reload=None)
+    reloaded = _reload_feedback(panel)
+    reloaded(ReloadOutcome(applied=True, config=config()))
+    assert panel.last_reload.endswith("applied (2 servers)")
+    assert len(calls) == 1
+    # A failed attempt is reported to the panel but never rebuilds handlers.
+    reloaded(ReloadOutcome(error="bad: not yaml"))
+    assert panel.last_reload.endswith("failed: bad: not yaml")
+    assert len(calls) == 1
+
+
+def test_cli_overrides_outlive_a_reload():
+    from pathlib import Path
+
+    from tunnel_switch.cli import _cli_overrides
+
+    cfg = config()
+    cfg.state_file = Path("/tmp/cli-state.json")
+    prepare = _cli_overrides(cfg, Path("--state-file"), "one")
+    desired = config(state_file="yaml-state.json")
+    prepare(desired)
+    assert desired.state_file == Path("/tmp/cli-state.json")
+    assert desired.server_name == "one"
+    # Without the switches the YAML value passes through untouched.
+    untouched = config(state_file="yaml-state.json")
+    _cli_overrides(cfg, None, None)(untouched)
+    assert untouched.state_file == Path("yaml-state.json")
+    assert untouched.server_name is None
+
+
+def test_create_app_refuses_an_empty_token(manager):
+    with pytest.raises(ValueError, match="must not be empty"):
+        create_app(manager.config, "")
+
+
+async def test_rotate_endpoint_adopts_a_deferred_bind(yaml_file, manager):
+    app = create_app(manager.config, "secret", manager, config_path=yaml_file)
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yaml_file.write_text(document(proxy={"ip": "127.0.0.1", "port": 1090}))
+        reloaded = (await client.post("/reload", headers=headers)).json()
+        assert reloaded["applied"]
+        assert reloaded["deferred"]
+        assert manager.config.proxy.port == 1080
+        status = (await client.post("/rotate", headers=headers)).json()
+    assert status["proxy"]["port"] == 1090
+    await manager.close()
+
+
+async def test_signal_trigger_failure_keeps_the_poller_alive(yaml_file, manager):
+    """The SIGHUP hook is best effort: a loop that refuses it changes nothing."""
+    from types import SimpleNamespace as Namespace
+
+    from tunnel_switch.api import _start_reload
+
+    reloader = ConfigReloader(yaml_file, manager.config, targets=[manager])
+    loop = Namespace(
+        add_signal_handler=lambda *args, **kwargs: (_ for _ in ()).throw(
+            NotImplementedError("no signals here")
+        )
+    )
+    stop = asyncio.Event()
+    app = Namespace(state=Namespace(reloader=reloader))
+    poller = _start_reload(app, loop, stop, True)
+    assert poller is not None
+    stop.set()
+    await poller
+    assert stop.is_set()
+
+
+async def test_poller_idles_then_stops_without_changes(yaml_file, manager):
+    reloader = ConfigReloader(
+        yaml_file, manager.config, targets=[manager], interval=0.02
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(reloader.run(stop))
+    await asyncio.sleep(0.1)  # several idle ticks: signature unchanged
+    assert not task.done()
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    assert reloader.last_reload is None
+    await manager.close()
+
+
+def test_signature_of_a_missing_file_is_none(tmp_path):
+    reloader = ConfigReloader(tmp_path / "gone.yaml", config())
+    assert reloader._signature_now() is None
+
+
+def test_apply_pending_binds_without_a_pending_change_is_a_noop(tmp_path):
+    reloader = ConfigReloader(tmp_path / "config.yaml", config())
+    assert reloader.apply_pending_binds() is None
+
+
+def test_reload_outcome_summaries():
+    from tunnel_switch.reload import ReloadOutcome
+
+    assert ReloadOutcome(error="bad: not yaml").summary() == "failed: bad: not yaml"
+    assert ReloadOutcome(unchanged=True).summary() == "unchanged"
+    applied = ReloadOutcome(
+        applied=True,
+        deferred=[
+            "proxy bind 127.0.0.1:1080 -> 127.0.0.1:1090 applies on the next rotation"
+        ],
+        config=config(),
+    )
+    assert applied.summary() == (
+        "applied (2 servers); proxy bind 127.0.0.1:1080 -> 127.0.0.1:1090"
+        " applies on the next rotation"
+    )
+    assert ReloadOutcome(applied=True, config=config()).summary() == (
+        "applied (2 servers)"
+    )
+    assert ReloadOutcome(applied=True).summary() == "applied (0 servers)"
+
+
+def test_payload_reports_every_field():
+    from tunnel_switch.reload import ReloadOutcome
+
+    payload = ReloadOutcome(unchanged=True, config=config()).payload()
+    assert payload == {
+        "applied": False,
+        "unchanged": True,
+        "error": None,
+        "deferred": [],
+        "servers": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "started,expected",
+    [
+        (None, ""),
+        ("", ""),
+        ("seconds", "30s"),
+        ("minutes", "5m 30s"),
+        ("hours", "2h 5m"),
+    ],
+)
+def test_elapsed_formats_every_span(started, expected):
+    from datetime import datetime, timedelta, timezone
+
+    from tunnel_switch.status import _elapsed
+
+    now = datetime.now(timezone.utc)
+    spans = {
+        "seconds": timedelta(seconds=30),
+        "minutes": timedelta(minutes=5, seconds=30),
+        "hours": timedelta(hours=2, minutes=5),
+    }
+    value = None if started in (None, "") else (now - spans[started]).isoformat()
+    assert _elapsed(value) == expected
+
+
+def test_panel_row_of_a_disabled_log_file():
+    """`file: null` is reported as disabled rather than as a path."""
+    text = rendered(config(logging={"file": None}), state=None)
+    assert "disabled" in text
+
+
+def test_key_reader_without_a_terminal(monkeypatch):
+    import sys
+
+    from tunnel_switch.status import _key_reader
+
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    descriptor, restore = _key_reader()
+    assert descriptor is None
+    restore()
+
+
+def test_key_reader_on_a_non_posix_platform(monkeypatch):
+    from tunnel_switch import status
+
+    monkeypatch.setattr(status.os, "name", "nt")
+    descriptor, restore = status._key_reader()
+    assert descriptor is None
+    restore()
+
+
+def test_key_reader_cbreaks_a_terminal_and_restores_it(monkeypatch):
+    import sys
+    import termios
+    import tty
+
+    from tunnel_switch.status import _key_reader
+
+    saved = ["original"]
+    applied = []
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: saved)
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: applied.append(("cbreak", fd)))
+    monkeypatch.setattr(
+        termios, "tcsetattr", lambda fd, when, buf: applied.append(("restore", buf))
+    )
+    descriptor, restore = _key_reader()
+    assert descriptor == 7
+    assert applied == [("cbreak", 7)]
+    restore()
+    assert applied == [("cbreak", 7), ("restore", saved)]
+
+
+def test_key_reader_gives_up_when_the_terminal_refuses(monkeypatch):
+    import sys
+    import termios
+
+    from tunnel_switch.status import _key_reader
+
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(
+        termios, "tcgetattr", lambda fd: (_ for _ in ()).throw(OSError())
+    )
+    descriptor, restore = _key_reader()
+    assert descriptor is None
+    restore()
+
+
+def test_key_reader_survives_a_failing_restore(monkeypatch):
+    import sys
+    import termios
+    import tty
+
+    from tunnel_switch.status import _key_reader
+
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["original"])
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(
+        termios, "tcsetattr", lambda fd, when, buf: (_ for _ in ()).throw(OSError())
+    )
+    descriptor, restore = _key_reader()
+    assert descriptor == 7
+    restore()  # a terminal that refuses to be restored ends the display, not the service
+
+
+def test_handle_keys_dispatches_and_ignores(monkeypatch):
+    from tunnel_switch import status
+
+    calls = []
+    state = PanelState()
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x12")
+    status._handle_keys(0, {"reload": lambda: calls.append("reload")}, state)
+    # An action the mapping does not know is dropped without a word.
+    status._handle_keys(0, {"rotate": lambda: calls.append("rotate")}, state)
+    status._handle_keys(0, None, state)
+    assert calls == ["reload"]
+    assert state.last_action is None
+
+
+def test_handle_keys_waits_for_the_escape_follow_up(monkeypatch):
+    from tunnel_switch import status
+
+    reads = iter([b"\x1b", b"r"])
+    monkeypatch.setattr(status.os, "read", lambda fd, n: next(reads))
+    monkeypatch.setattr(status.select, "select", lambda *args: ([0], [], []))
+    calls = []
+    status._handle_keys(0, {"restart": lambda: calls.append("restart")}, PanelState())
+    assert calls == ["restart"]
+
+
+def test_handle_keys_reports_a_failing_action(monkeypatch):
+    from tunnel_switch import status
+
+    def refuse():
+        raise OSError("no keyboard")
+
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x05")
+    state = PanelState()
+    status._handle_keys(0, {"connect": refuse}, state)
+    assert state.last_action == "connect: no keyboard"
+
+
+def test_display_reads_keys_until_stop(monkeypatch):
+    """The interactive branch: select wakes on a key, the handler runs it."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from tunnel_switch import status
+
+    manager = TunnelManager(config())
+    stop = status.Event()
+    calls = []
+    rounds = []
+
+    def fake_select(readers, writes, errors, timeout):
+        if not rounds:
+            rounds.append(1)
+            return (readers, [], [])
+        stop.set()
+        return ([], [], [])
+
+    monkeypatch.setattr(status, "_key_reader", lambda: (7, lambda: None))
+    monkeypatch.setattr(status.select, "select", fake_select)
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x12")
+    status.run_status_display(
+        manager,
+        stop,
+        console=Console(file=StringIO(), width=100),
+        actions={"reload": lambda: calls.append("reload")},
+        state=PanelState(),
+    )
+    assert calls == ["reload"]
+    assert stop.is_set()

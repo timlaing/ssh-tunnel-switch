@@ -186,22 +186,8 @@ def serve(
     """Start the API and manage one SSH process; Ctrl-C stops the service."""
     config = resolve_config(config)
     cfg = load_config(config)
-    if state_file is not None:
-        cfg.state_file = resolve_state_file(state_file, cfg, config)
-    if server_name is not None:
-        if server_name not in {server.name for server in cfg.servers}:
-            raise ValueError(
-                f"Unknown server name: {server_name}. Choose one of: {', '.join(server.name for server in cfg.servers)}"
-            )
-        cfg.server_name = server_name
+    _apply_startup_overrides(cfg, config, state_file, server_name)
     token = ensure_api_token(config, cfg)
-    typer.echo(f"API token: {token}")
-    if cfg.state_file is not None:
-        typer.echo(f"State file: {cfg.state_file}")
-    if cfg.http_proxy.enabled:
-        ip = str(cfg.http_proxy.ip)
-        host = f"[{ip}]" if ":" in ip else ip
-        typer.echo(f"HTTP proxy: http://{host}:{cfg.http_proxy.port}")
     # An interactive terminal keeps a WARNING+ console handler so failures that
     # happen before (or behind) the status panel are still visible, even when
     # file logging is disabled; headless runs get every record on stderr.
@@ -210,13 +196,59 @@ def serve(
         console=True,
         console_level=logging.WARNING if is_tty() else logging.INFO,
     )
-    if log_file is not None:
-        typer.echo(f"Log file: {log_file}")
+    _echo_startup(cfg, token, log_file)
     manager = TunnelManager(cfg)
     panel_state = PanelState()
+    application = create_app(
+        cfg,
+        token,
+        manager,
+        config_path=config,
+        watch=watch,
+        on_reload=[_reload_feedback(panel_state)],
+        prepare=_cli_overrides(cfg, state_file, server_name),
+    )
+    if is_tty():
+        # uvicorn keeps the main thread so Ctrl-C and SIGTERM still trigger its
+        # graceful shutdown (and the SSH process cleanup in the app lifespan);
+        # the status display owns the console from a daemon thread instead.
+        _display_and_serve(application, cfg, manager, panel_state)
+    else:
+        _run_uvicorn(application, cfg)
+
+
+def _apply_startup_overrides(cfg, config, state_file, server_name):
+    if state_file is not None:
+        cfg.state_file = resolve_state_file(state_file, cfg, config)
+    if server_name is None:
+        return
+    if server_name not in {server.name for server in cfg.servers}:
+        raise ValueError(
+            f"Unknown server name: {server_name}. Choose one of: {', '.join(server.name for server in cfg.servers)}"
+        )
+    cfg.server_name = server_name
+
+
+def _echo_startup(cfg, token, log_file):
+    typer.echo(f"API token: {token}")
+    if cfg.state_file is not None:
+        typer.echo(f"State file: {cfg.state_file}")
+    if cfg.http_proxy.enabled:
+        ip = str(cfg.http_proxy.ip)
+        host = f"[{ip}]" if ":" in ip else ip
+        typer.echo(f"HTTP proxy: http://{host}:{cfg.http_proxy.port}")
+    if log_file is not None:
+        typer.echo(f"Log file: {log_file}")
+
+
+def _console_level() -> int:
+    return logging.WARNING if is_tty() else logging.INFO
+
+
+def _reload_feedback(panel_state):
+    """Feed the panel and reconfigure logging after every reload attempt."""
 
     def reloaded(outcome):
-        """Feed the panel and reconfigure logging after every reload attempt."""
         panel_state.last_reload = (
             f"{datetime.now(timezone.utc):%H:%M:%S} {outcome.summary()}"
         )
@@ -224,59 +256,51 @@ def serve(
             configure_logging(
                 outcome.config.logging,
                 console=True,
-                console_level=logging.WARNING if is_tty() else logging.INFO,
+                console_level=_console_level(),
             )
 
-    def prepare_overrides(desired):
-        """CLI overrides outlive a reload; the YAML values apply after a restart."""
+    return reloaded
+
+
+def _cli_overrides(cfg, state_file, server_name):
+    """CLI overrides outlive a reload; the YAML values apply after a restart."""
+
+    def prepare(desired):
         if state_file is not None:
             desired.state_file = cfg.state_file
         if server_name is not None:
             desired.server_name = server_name
 
-    application = create_app(
-        cfg,
-        token,
-        manager,
-        config_path=config,
-        watch=watch,
-        on_reload=[reloaded],
-        prepare=prepare_overrides,
+    return prepare
+
+
+def _run_uvicorn(application, cfg):
+    uvicorn.run(
+        application,
+        host=str(cfg.api.ip),
+        port=cfg.api.port,
+        workers=1,
+        log_config=None,
     )
-    if is_tty():
-        # uvicorn keeps the main thread so Ctrl-C and SIGTERM still trigger its
-        # graceful shutdown (and the SSH process cleanup in the app lifespan);
-        # the status display owns the console from a daemon thread instead.
-        stop = Event()
-        display = Thread(
-            target=run_status_display,
-            args=(manager, stop),
-            kwargs={
-                "actions": key_actions(application, manager, panel_state),
-                "state": panel_state,
-            },
-            daemon=True,
-        )
-        display.start()
-        try:
-            uvicorn.run(
-                application,
-                host=str(cfg.api.ip),
-                port=cfg.api.port,
-                workers=1,
-                log_config=None,
-            )
-        finally:
-            stop.set()
-            display.join(timeout=2 * REFRESH_SECONDS + 1)
-    else:
-        uvicorn.run(
-            application,
-            host=str(cfg.api.ip),
-            port=cfg.api.port,
-            workers=1,
-            log_config=None,
-        )
+
+
+def _display_and_serve(application, cfg, manager, panel_state):
+    stop = Event()
+    display = Thread(
+        target=run_status_display,
+        args=(manager, stop),
+        kwargs={
+            "actions": key_actions(application, manager, panel_state),
+            "state": panel_state,
+        },
+        daemon=True,
+    )
+    display.start()
+    try:
+        _run_uvicorn(application, cfg)
+    finally:
+        stop.set()
+        display.join(timeout=2 * REFRESH_SECONDS + 1)
 
 
 def request(path: Path | None, method: str, endpoint: str):

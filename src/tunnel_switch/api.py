@@ -13,38 +13,64 @@ from .tunnel import RotationRejected, TunnelFailure, TunnelManager
 logger = logging.getLogger(__name__)
 
 
-def create_app(
-    config: Config,
-    token: str,
-    manager: TunnelManager | None = None,
-    *,
-    config_path=None,
-    watch: bool = True,
-    on_reload: Sequence[Callable[[ReloadOutcome], None]] = (),
-    prepare: Callable[[Config], None] | None = None,
-) -> FastAPI:
-    if not token:
-        raise ValueError("API token must not be empty")
-    manager = manager or TunnelManager(config)
-    proxy = HTTPProxyServer(config)
+def _build_reloader(app, config, config_path, on_reload, prepare, manager):
+    """Create the reloader, or None when the service was given no YAML file.
 
+    ``app.state`` is one of the reload targets, so the app must exist first;
+    the lifespan reads the reloader back from there once it starts.
+    """
+    if config_path is None:
+        return None
+    return ConfigReloader(
+        config_path,
+        config,
+        targets=[manager, app.state.http_proxy, app.state],
+        hooks=on_reload,
+        prepare=prepare,
+        busy=lambda: manager.busy,
+    )
+
+
+def _start_reload(app, loop, stop, watch):
+    """Start the config poller and the SIGHUP trigger; return the poll task."""
+    reloader = app.state.reloader
+    if reloader is None:
+        return None
+    poller = None
+    if watch:
+        poller = asyncio.create_task(reloader.run(stop))
+    try:
+        # A manual trigger for systemd's ExecReload, independent of polling.
+        loop.add_signal_handler(
+            signal.SIGHUP, lambda: asyncio.create_task(reloader.reload_now())
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.debug("SIGHUP reload trigger unavailable: %s", exc)
+    return poller
+
+
+async def _stop_reload(app, loop, stop, poller):
+    if app.state.reloader is not None:
+        loop.remove_signal_handler(signal.SIGHUP)
+    if poller is not None:
+        stop.set()
+        await poller
+
+
+async def _close(proxy, manager):
+    try:
+        await proxy.close()
+    finally:
+        await manager.close()
+
+
+def _lifespan(config, manager, proxy, watch):
     @asynccontextmanager
     async def lifespan(app):
         loop = asyncio.get_running_loop()
         app.state.loop = loop
         stop = asyncio.Event()
-        reloader = app.state.reloader
-        poller = None
-        if reloader is not None:
-            if watch:
-                poller = asyncio.create_task(reloader.run(stop))
-            try:
-                # A manual trigger for systemd's ExecReload, independent of polling.
-                loop.add_signal_handler(
-                    signal.SIGHUP, lambda: asyncio.create_task(reloader.reload_now())
-                )
-            except (NotImplementedError, RuntimeError, ValueError) as exc:
-                logger.debug("SIGHUP reload trigger unavailable: %s", exc)
+        poller = _start_reload(app, loop, stop, watch)
         try:
             if config.start_on_launch:
                 await manager.rotate()
@@ -52,55 +78,37 @@ def create_app(
             yield
         finally:
             try:
-                if reloader is not None:
-                    loop.remove_signal_handler(signal.SIGHUP)
-                if poller is not None:
-                    stop.set()
-                    await poller
+                await _stop_reload(app, loop, stop, poller)
             finally:
-                try:
-                    await proxy.close()
-                finally:
-                    await manager.close()
+                await _close(proxy, manager)
 
-    app = FastAPI(title="Tunnel Switch", lifespan=lifespan)
-    app.state.manager = manager
-    app.state.http_proxy = proxy
-    app.state.config = config
-    app.state.loop = None
-    # Every reload swaps the config attribute of these objects, so the API, the
-    # tunnel manager and the HTTP bridge switch configuration as one reference.
-    app.state.reloader = (
-        None
-        if config_path is None
-        else ConfigReloader(
-            config_path,
-            config,
-            targets=[manager, proxy, app.state],
-            hooks=on_reload,
-            prepare=prepare,
-            busy=lambda: manager.busy,
-        )
-    )
+    return lifespan
 
+
+def _authorizer(app, token):
     def authorize(authorization: str | None = Header(default=None)):
         # The current token is read per request so a reload can rotate it.
-        current = app.state.config.api.token or token
+        expected = f"Bearer {app.state.config.api.token or token}".encode()
         if authorization is None or not secrets.compare_digest(
-            authorization.encode(), f"Bearer {current}".encode()
+            authorization.encode(), expected
         ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
-    def reload_block():
-        reloader = app.state.reloader
-        return {
-            "watching": reloader is not None and watch,
-            "path": str(config_path) if config_path is not None else None,
-            "last_reload": reloader.last_reload if reloader else None,
-            "last_error": reloader.last_error if reloader else None,
-            "deferred": list(reloader.deferred) if reloader else [],
-        }
+    return authorize
 
+
+def _reload_status(app, config_path, watch):
+    reloader = app.state.reloader
+    return {
+        "watching": reloader is not None and watch,
+        "path": str(config_path) if config_path is not None else None,
+        "last_reload": reloader.last_reload if reloader else None,
+        "last_error": reloader.last_error if reloader else None,
+        "deferred": list(reloader.deferred) if reloader else [],
+    }
+
+
+def _register_routes(app, manager, authorize, config_path, watch):
     @app.get("/status", dependencies=[Depends(authorize)])
     async def status():
         current = app.state.config
@@ -111,7 +119,7 @@ def create_app(
                 "ip": str(current.http_proxy.ip),
                 "port": current.http_proxy.port,
             },
-            "config_reload": reload_block(),
+            "config_reload": _reload_status(app, config_path, watch),
         }
 
     @app.post(
@@ -163,4 +171,32 @@ def create_app(
             )
         return (await reloader.reload_now()).payload()
 
+
+def create_app(
+    config: Config,
+    token: str,
+    manager: TunnelManager | None = None,
+    *,
+    config_path=None,
+    watch: bool = True,
+    on_reload: Sequence[Callable[[ReloadOutcome], None]] = (),
+    prepare: Callable[[Config], None] | None = None,
+) -> FastAPI:
+    if not token:
+        raise ValueError("API token must not be empty")
+    manager = manager or TunnelManager(config)
+    proxy = HTTPProxyServer(config)
+    app = FastAPI(
+        title="Tunnel Switch", lifespan=_lifespan(config, manager, proxy, watch)
+    )
+    app.state.manager = manager
+    app.state.http_proxy = proxy
+    app.state.config = config
+    app.state.loop = None
+    # Every reload swaps the config attribute of these objects, so the API, the
+    # tunnel manager and the HTTP bridge switch configuration as one reference.
+    app.state.reloader = _build_reloader(
+        app, config, config_path, on_reload, prepare, manager
+    )
+    _register_routes(app, manager, _authorizer(app, token), config_path, watch)
     return app
