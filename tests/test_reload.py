@@ -191,10 +191,68 @@ async def test_reload_defers_while_a_rotation_is_in_progress(yaml_file):
     )
     yaml_file.write_text(document(cooldown_seconds=99))
     outcome = await reloader.reload_now()
+    assert outcome.refused
     assert outcome.error == "rotation in progress"
     assert manager.config.cooldown_seconds == 0
     # A refused reload never reaches the panel or the logging hook.
     assert not reached
+    await manager.close()
+
+
+async def test_poller_retries_a_reload_refused_during_a_rotation(yaml_file):
+    """A refused tick keeps the old signature, so the next tick tries again."""
+    cfg = load_config(yaml_file)
+    manager = TunnelManager(cfg)
+    gate = {"busy": True}
+    reloader = ConfigReloader(
+        yaml_file, cfg, targets=[manager], interval=0.05, busy=lambda: gate["busy"]
+    )
+    yaml_file.write_text(document(cooldown_seconds=99))
+    stop = asyncio.Event()
+    task = asyncio.create_task(reloader.run(stop))
+    try:
+        await asyncio.sleep(0.3)  # Several refused (or debouncing) ticks.
+        assert manager.config.cooldown_seconds == 0
+        gate["busy"] = False  # The rotation finishes; the change must land.
+        await until(lambda: manager.config.cooldown_seconds == 99)
+    finally:
+        stop.set()
+        await task
+    await manager.close()
+
+
+async def test_reload_refuses_when_a_rotation_starts_during_validation(yaml_file):
+    """The file is read in a thread, so the busy gate is re-checked after it."""
+    cfg = load_config(yaml_file)
+    manager = TunnelManager(cfg)
+    checks = []
+
+    def busy() -> bool:
+        checks.append(True)
+        return len(checks) > 1  # Idle at entry, rotating once the read returns.
+
+    reloader = ConfigReloader(yaml_file, cfg, targets=[manager], busy=busy)
+    yaml_file.write_text(document(cooldown_seconds=99))
+    outcome = await reloader.reload_now()
+    assert outcome.refused
+    assert manager.config.cooldown_seconds == 0
+    assert reloader.last_reload is None
+    await manager.close()
+
+
+async def test_unchanged_reload_clears_a_stale_error(yaml_file):
+    """A file that validates again must not keep reporting the old failure."""
+    cfg = load_config(yaml_file)
+    manager = TunnelManager(cfg)
+    reloader = ConfigReloader(yaml_file, cfg, targets=[manager])
+    yaml_file.write_text("servers: [")  # Broken mid-edit.
+    failed = await reloader.reload_now()
+    assert failed.error
+    assert reloader.last_error is not None
+    yaml_file.write_text(document())  # Repaired back to the running config.
+    outcome = await reloader.reload_now()
+    assert outcome.unchanged
+    assert reloader.last_error is None
     await manager.close()
 
 
@@ -591,6 +649,34 @@ async def test_rotate_endpoint_adopts_a_deferred_bind(yaml_file, manager):
     await manager.close()
 
 
+async def test_rejected_rotation_keeps_the_running_bind(yaml_file, manager):
+    """A 429 must not adopt the deferred bind of the tunnel still serving."""
+    app = create_app(manager.config, "secret", manager, config_path=yaml_file)
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yaml_file.write_text(
+            document(cooldown_seconds=99, proxy={"ip": "127.0.0.1", "port": 1090})
+        )
+        assert (await client.post("/reload", headers=headers)).json()["applied"]
+        status = (await client.post("/rotate", headers=headers)).json()
+        assert status["proxy"]["port"] == 1090
+        # While the cooldown holds, another deferred bind arrives and the next
+        # rotation is rejected before it ever admits.
+        yaml_file.write_text(
+            document(cooldown_seconds=99, proxy={"ip": "127.0.0.1", "port": 1100})
+        )
+        reloaded = (await client.post("/reload", headers=headers)).json()
+        assert reloaded["deferred"]
+        rejected = await client.post("/rotate", headers=headers)
+        assert rejected.status_code == 429
+        # The running tunnel keeps serving on the bind it was started with.
+        assert manager.config.proxy.port == 1090
+        assert app.state.reloader.pending is not None
+    await manager.close()
+
+
 async def test_signal_trigger_failure_keeps_the_poller_alive(yaml_file, manager):
     """The SIGHUP hook is best effort: a loop that refuses it changes nothing."""
     from types import SimpleNamespace as Namespace
@@ -665,10 +751,27 @@ def test_payload_reports_every_field():
     assert payload == {
         "applied": False,
         "unchanged": True,
+        "refused": False,
         "error": None,
         "deferred": [],
         "servers": 2,
     }
+    assert ReloadOutcome(refused=True, error="rotation in progress").payload() == {
+        "applied": False,
+        "unchanged": False,
+        "refused": True,
+        "error": "rotation in progress",
+        "deferred": [],
+        "servers": None,
+    }
+
+
+def test_refused_summary_is_not_reported_as_a_failure():
+    from tunnel_switch.reload import ReloadOutcome
+
+    outcome = ReloadOutcome(refused=True, error="rotation in progress")
+    assert outcome.summary() == "refused: rotation in progress"
+    assert ReloadOutcome(refused=True).summary() == "refused"
 
 
 @pytest.mark.parametrize(

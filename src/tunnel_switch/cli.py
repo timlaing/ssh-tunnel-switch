@@ -114,12 +114,11 @@ def key_actions(application, manager, panel_state):
 
         return dispatch
 
-    def apply_pending():
+    def pending_bind():
+        """The hook rotate()/restart() run once admitted: a new ssh process
+        rebinds the SOCKS socket, so a deferred bind becomes live there."""
         reloader = getattr(application.state, "reloader", None)
-        if reloader is not None:
-            # A new ssh process rebinds the SOCKS socket, so a deferred bind
-            # becomes live on every connection change.
-            reloader.apply_pending_binds()
+        return None if reloader is None else reloader.apply_pending_binds
 
     async def reload_config():
         reloader = getattr(application.state, "reloader", None)
@@ -131,18 +130,15 @@ def key_actions(application, manager, panel_state):
         status = manager.status()
         if status["state"] == "connected":
             return f"already connected to {status['server']}; Alt+R restarts it"
-        apply_pending()
-        await manager.restart()
+        await manager.restart(pending_bind())
         return f"connect: tunnel up on {manager.status()['server']}"
 
     async def restart():
-        apply_pending()
-        await manager.restart()
+        await manager.restart(pending_bind())
         return f"restart: {manager.status()['server']}"
 
     async def rotate():
-        apply_pending()
-        await manager.rotate()
+        await manager.rotate(pending_bind())
         return f"rotate: {manager.status()['server']}"
 
     async def disconnect():

@@ -75,17 +75,21 @@ class ReloadOutcome:
         *,
         applied: bool = False,
         unchanged: bool = False,
+        refused: bool = False,
         error: str | None = None,
         deferred: Sequence[str] = (),
         config: Config | None = None,
     ):
         self.applied = applied
         self.unchanged = unchanged
+        self.refused = refused
         self.error = error
         self.deferred = tuple(deferred)
         self.config = config
 
     def summary(self) -> str:
+        if self.refused:
+            return f"refused: {self.error}" if self.error else "refused"
         if self.error is not None:
             return f"failed: {self.error}"
         if self.unchanged:
@@ -99,6 +103,7 @@ class ReloadOutcome:
         return {
             "applied": self.applied,
             "unchanged": self.unchanged,
+            "refused": self.refused,
             "error": self.error,
             "deferred": list(self.deferred),
             "servers": len(self.config.servers) if self.config is not None else None,
@@ -161,14 +166,18 @@ class ConfigReloader:
                 continue
             # Let an editor that writes in place finish before validating.
             await asyncio.sleep(DEBOUNCE_SECONDS)
+            previous = self._signature
             self._signature = self._signature_now()
-            await self.reload_now()
+            outcome = await self.reload_now()
+            if outcome.refused:
+                # The rotation wins this tick; the old signature makes the
+                # next tick detect the change again and retry.
+                self._signature = previous
 
     async def reload_now(self) -> ReloadOutcome:
         """Validate the file and apply every change that needs no rebind."""
         if self.busy is not None and self.busy():
-            logger.debug("Configuration reload deferred: a rotation is in progress")
-            return ReloadOutcome(error="rotation in progress", config=self.config)
+            return self._refused()
         try:
             desired = await asyncio.to_thread(load_config, self.path)
         except Exception as exc:
@@ -181,11 +190,17 @@ class ConfigReloader:
             )
             self._notify(outcome)
             return outcome
+        if self.busy is not None and self.busy():
+            # A rotation started while the file was being validated, so the
+            # swap would land mid-rotation; refused until the next attempt.
+            return self._refused()
         if self.prepare is not None:
             self.prepare(desired)
         merged, deferred = merge_binds(self.config, desired)
         self._signature = self._signature_now()
         if merged == self.config and not deferred:
+            # The file validates again, so any earlier parse failure is stale.
+            self.last_error = None
             logger.debug("Configuration reloaded with no effective change")
             return ReloadOutcome(unchanged=True, deferred=deferred, config=self.config)
         self.config = merged
@@ -229,6 +244,13 @@ class ConfigReloader:
             _endpoint(adopted.proxy),
         )
         return adopted
+
+    def _refused(self) -> ReloadOutcome:
+        """A rotation owns the loop: the reload keeps its old signature and retries."""
+        logger.debug("Configuration reload deferred: a rotation is in progress")
+        return ReloadOutcome(
+            refused=True, error="rotation in progress", config=self.config
+        )
 
     def _notify(self, outcome: ReloadOutcome) -> None:
         for hook in self.hooks:

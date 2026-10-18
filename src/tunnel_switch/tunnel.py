@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
 import socket
@@ -44,6 +45,9 @@ class TunnelManager:
         self._index = remembered - 1 if remembered is not None else -1
         self._busy = False
         self._last_rotation = None
+        # False until the first connection attempt: before that, "the current
+        # server" is the one a rotation would pick, not one we have tried.
+        self._attempted = False
 
     @property
     def busy(self) -> bool:
@@ -167,41 +171,62 @@ class TunnelManager:
                     "SOCKS bind address is already occupied or unavailable"
                 ) from exc
 
-    async def rotate(self) -> dict:
-        """Connect through the next server, falling back to the rest of the list."""
+    async def rotate(self, pre_connect: Callable[[], None] | None = None) -> dict:
+        """Connect through the next server, falling back to the rest of the list.
+
+        ``pre_connect`` runs once the rotation is admitted and before the
+        first await, so admission and the deferred SOCKS bind adoption it
+        unlocks are one atomic step in the service event loop.
+        """
         # No await before admission: atomic within the single service event loop.
         self._admit()
-        return await self._change(self._rotate_across_servers)
+        return await self._change(self._rotate_across_servers, pre_connect)
 
-    async def restart(self) -> dict:
+    async def restart(self, pre_connect: Callable[[], None] | None = None) -> dict:
         """Reconnect to the server the rotation index currently names.
 
         The index is pinned instead of advanced, so a restart bounces the
         current server; if it refuses SSH, the same failover as rotate() runs.
+        Before the first attempt there is no current server to bounce, so the
+        restart picks the server the next rotation would have (the saved one,
+        after a service restart).
         """
         self._admit()
-        first = self._index if self._index >= 0 else 0
+        first = self._index if self._attempted else None
         return await self._change(
-            lambda: self._rotate_across_servers(first_index=first)
+            lambda: self._rotate_across_servers(first_index=first), pre_connect
         )
 
     async def disconnect(self) -> dict:
         """Stop the tunnel without connecting elsewhere.
 
         Stopping never contacts an SSH server, so it also clears the cooldown
-        gate: a subsequent restart() or rotate() reconnects immediately.
+        gate: a subsequent restart() or rotate() reconnects immediately. The
+        busy flag is held across the stop so no rotation or restart can be
+        admitted while the old connection is still shutting down.
         """
         if self._busy:
             raise RotationRejected("Tunnel rotation already in progress")
-        await self._stop()
-        self._last_rotation = None
+        self._busy = True
+        try:
+            await self._stop()
+        finally:
+            self._last_rotation = None
+            self._busy = False
         logger.info("Tunnel disconnected")
         return self.status()
 
-    async def _change(self, connect) -> dict:
+    async def _change(
+        self, connect, pre_connect: Callable[[], None] | None = None
+    ) -> dict:
         self._busy = True
         self.last_error = None
         try:
+            if pre_connect is not None:
+                # Synchronous and await-free: admitted state and the adopted
+                # bind become visible to the rest of the loop at the same
+                # instant, and the finally below still releases the busy flag.
+                pre_connect()
             await connect()
         finally:
             self._last_rotation = time.monotonic()
@@ -222,6 +247,8 @@ class TunnelManager:
         if first_index is None:
             first_index = (self._index + 1) % len(servers)
         self._index = (first_index - 1) % len(servers)
+        # From here on a restart pins this index instead of advancing one.
+        self._attempted = True
         failures = []
         try:
             for attempt in range(len(servers)):

@@ -175,6 +175,35 @@ async def test_disconnect_is_rejected_while_a_rotation_runs(manager):
     await manager.close()
 
 
+async def test_rotation_is_rejected_while_a_disconnect_stops(manager):
+    """The busy flag is held across the stop, so nothing interleaves with it."""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_stop():
+        entered.set()
+        await release.wait()
+
+    manager._stop = slow_stop
+    task = asyncio.create_task(manager.disconnect())
+    await entered.wait()
+    with pytest.raises(RotationRejected, match="in progress"):
+        await manager.rotate()
+    with pytest.raises(RotationRejected, match="in progress"):
+        await manager.restart()
+    release.set()
+    assert (await task)["state"] == "disconnected"
+    assert manager.busy is False
+    await manager.close()
+
+
+async def test_restart_before_any_attempt_uses_the_remembered_server(manager):
+    manager._index = 0  # The state file remembered server "two".
+    # Before the first attempt there is no current server to pin, so the
+    # restart connects where a rotation would have: the saved server.
+    assert (await manager.restart())["server"] == "two"
+    await manager.close()
+
+
 async def test_failure_cleans_process_and_cools_down(manager):
     manager.config.cooldown_seconds = 30
     manager.config.startup_timeout_seconds = 0.01

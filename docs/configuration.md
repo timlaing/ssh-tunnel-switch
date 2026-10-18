@@ -185,11 +185,11 @@ The state path must differ from the YAML and explicitly configured identity file
 
 The `/status`, `/rotate` and `/reload` endpoints require `Authorization: Bearer <token>`. FastAPI interactive API docs are available at `/docs`.
 
-| Endpoint       | Result                                                                                                                                                                                                          |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)                    |
-| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                  |
-| `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file |
+| Endpoint       | Result                                                                                                                                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /status`  | State, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)                               |
+| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                             |
+| `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `refused`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file |
 
 Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
 
@@ -198,7 +198,11 @@ the service was started without a configuration file; a YAML that fails
 validation is reported as `error` in a **200** response and as
 `config_reload.last_error` in `/status`, with the previous configuration kept.
 A rotation (`POST /rotate`) also adopts a `proxy` change that an earlier
-reload had to defer, since it creates a fresh `ssh` process.
+reload had to defer, since it creates a fresh `ssh` process — but only once the
+rotation is admitted, so a request rejected by the cooldown or a concurrent
+rotation leaves the still-running tunnel on its original bind. The file watcher
+retries the same way: a reload that finds a rotation in progress is refused and
+picked up again on the next poll.
 
 ```sh
 .venv/bin/tunnel-switch status --config config.yaml

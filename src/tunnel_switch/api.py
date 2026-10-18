@@ -132,12 +132,12 @@ def _register_routes(app, manager, authorize, config_path, watch):
     )
     async def rotate():
         reloader = app.state.reloader
-        if reloader is not None:
-            # A rotation creates a fresh ssh process, so a deferred SOCKS bind
-            # becomes live here instead of waiting for a restart.
-            reloader.apply_pending_binds()
+        # A rotation creates a fresh ssh process, so a deferred SOCKS bind
+        # becomes live there — but only once the rotation is admitted: a
+        # rejected request must leave the still-running bind untouched.
+        pending = reloader.apply_pending_binds if reloader is not None else None
         try:
-            return await manager.rotate()
+            return await manager.rotate(pending)
         except RotationRejected as exc:
             raise HTTPException(
                 status_code=429,
