@@ -43,6 +43,8 @@ Edit the SSH host aliases in the YAML. Verify host keys and key/agent authentica
 
 Startup generates and saves an API token if needed and prints it to the console. Keep the configuration and logs private. On an interactive terminal `serve` shows a live status panel while timestamped service and access logs are written to the log file (`logging.file`); when run under systemd the timestamped lines also reach the journal. By default the SOCKS5 listener is `127.0.0.1:1080`, the HTTP proxy is `127.0.0.1:8118`, and the REST API is `127.0.0.1:8765`.
 
+The service watches its YAML and applies configuration changes without restarting or dropping the tunnel (`systemctl reload` or `POST /reload` trigger it immediately). On an interactive terminal the status panel also responds to keys: Ctrl+R reloads the configuration, Ctrl+E connects, Ctrl+D disconnects, Alt+R restarts the current server, Ctrl+N rotates to the next, and Ctrl+C still stops the service.
+
 ## Use the proxy
 
 ```sh
