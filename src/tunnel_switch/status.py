@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from . import __version__
 from .config import Config
 
 REFRESH_SECONDS = 0.5
@@ -110,7 +111,11 @@ def status_panel(
     if keys:
         body.append(Text(FOOTER[0], style="dim"))
         body.append(Text(FOOTER[1], style="dim"))
-    return Panel(Group(*body), title="SSH Tunnel Switch", border_style="blue")
+    return Panel(
+        Group(*body),
+        title=f"SSH Tunnel Switch {__version__}",
+        border_style="blue",
+    )
 
 
 def _key_reader():
