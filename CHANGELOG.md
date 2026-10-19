@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-10-19
+
+- Apply configuration changes without restarting the service or dropping the tunnel: `serve` watches its YAML file, validates each change and swaps it in while the tunnel keeps running; `POST /reload` and `SIGHUP` (systemd's `ExecReload`) apply the file immediately. A reload that arrives while a rotation is in progress is refused with 429 and picked up again by the watcher once the rotation finishes.
+- Adopt each change according to what it touches: servers, cooldown, timeouts, logging and the HTTP proxy upstream apply live; a changed SOCKS bind (`proxy.ip`/`proxy.port`) takes effect at the next connection change with a warning rather than rebinding a live tunnel; a changed API or HTTP proxy listener (`api.ip`/`api.port`, `http_proxy.*`) is reported as needing a restart.
+- Add interactive keys to the status panel footer: Ctrl+R reloads the configuration, Ctrl+E connects, Ctrl+D disconnects, Alt+R restarts the current server and Ctrl+N rotates to the next; Ctrl+C remains the quit key.
+- Report the running build's version everywhere it matters: `tunnel-switch --version`, the `version` field in `GET /status`, the status panel title and the `serve` startup banner.
+
 ## 1.2.0 — 2026-10-18
 
 - Fail over to the next configured server within a single rotation when a server refuses SSH or never becomes ready, instead of ending the rotation and making the caller wait out the cooldown. Each server is tried at most once and the rotation stops at the first one that connects; if every server fails the request still returns 503 with the last failure in `last_error`, and the log names each attempt.
