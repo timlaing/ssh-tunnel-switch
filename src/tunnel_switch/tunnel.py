@@ -6,6 +6,7 @@ import socket
 import time
 from uuid import uuid4
 from .config import Config, Server
+from .counters import RequestCounter
 from .state import load_last_server, save_last_server
 
 logger = logging.getLogger(__name__)
@@ -22,8 +23,12 @@ class TunnelFailure(Exception):
 
 
 class TunnelManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, counter: RequestCounter | None = None):
         self.config = config
+        # Shared with the HTTP proxy, which records into it while status()
+        # reports it: the request totals belong to the connection lifecycle
+        # this class owns, so they are read from here.
+        self.counter = counter or RequestCounter()
         self.process = None
         # (connection_id, started_at, server_name) published as one immutable
         # snapshot: the status display thread reads it while rotate()/_stop()
@@ -88,6 +93,12 @@ class TunnelManager:
             "server": server_name,
             "proxy": self.config.proxy.model_dump(mode="json"),
             "last_error": self.last_error,
+            # Only the adopted connection that is still running may own the
+            # current request total; a rotation in between or a tunnel that
+            # exited on its own reports its counts as the last total instead.
+            "requests": self.counter.snapshot(
+                active=alive and self._connection is not None
+            ),
         }
 
     def command(self, server: Server) -> list[str]:
@@ -352,6 +363,9 @@ class TunnelManager:
             datetime.now(timezone.utc),
             server.name,
         )
+        # The new connection owns the request totals from here on: the counts
+        # the previous one collected become the last value the panel shows.
+        self.counter.begin()
         # The tunnel is up: failing to persist the selection must not
         # move on to another server, since the same state file would fail.
         try:

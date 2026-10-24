@@ -4,6 +4,7 @@ from ipaddress import ip_address
 from urllib.parse import urlsplit
 import h11
 from .config import Config
+from .counters import RequestCounter
 
 
 class ProxyError(Exception):
@@ -47,8 +48,11 @@ def headers_for_forwarding(headers, *, host: str | None = None):
 
 
 class HTTPProxyServer:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, counter: RequestCounter | None = None):
         self.config = config
+        # The tunnel manager's counter, so the requests recorded here are the
+        # ones its status reports for the connection they were carried over.
+        self.counter = counter or RequestCounter()
         self.server = None
         self._tasks = set()
         self._closing = False
@@ -232,6 +236,10 @@ class HTTPProxyServer:
             status = 502
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 self._socks(host, port), self.config.http_proxy.connect_timeout_seconds)
+            # Counted once the tunnel accepts it: a forward and a CONNECT are
+            # each one request over the connection, and the encrypted requests
+            # inside a CONNECT tunnel cannot be seen from here.
+            self.counter.record()
             if connect:
                 writer.write(inbound.send(h11.Response(status_code=200, headers=[], reason=b"Connection Established")))
                 await writer.drain()

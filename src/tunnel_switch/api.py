@@ -7,6 +7,7 @@ from typing import Callable, Sequence
 from fastapi import Depends, FastAPI, Header, HTTPException
 from . import __version__
 from .config import Config
+from .counters import RequestCounter
 from .http_proxy import HTTPProxyServer
 from .reload import ConfigReloader, ReloadOutcome
 from .tunnel import RotationRejected, TunnelFailure, TunnelManager
@@ -195,11 +196,14 @@ def create_app(
     watch: bool = True,
     on_reload: Sequence[Callable[[ReloadOutcome], None]] = (),
     prepare: Callable[[Config], None] | None = None,
+    counter: RequestCounter | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("API token must not be empty")
-    manager = manager or TunnelManager(config)
-    proxy = HTTPProxyServer(config)
+    manager = manager or TunnelManager(config, counter=counter)
+    # The proxy records into the manager's counter, so one total backs both the
+    # status panel and GET /status no matter which of the two was built here.
+    proxy = HTTPProxyServer(config, counter=manager.counter)
     app = FastAPI(
         title="Tunnel Switch", lifespan=_lifespan(config, manager, proxy, watch)
     )

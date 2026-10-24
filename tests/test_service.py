@@ -92,6 +92,42 @@ async def test_status_reports_one_connection_snapshot(manager):
     await manager.close()
 
 
+async def test_request_totals_follow_the_connection(manager):
+    await manager.rotate()
+    # The adopted connection opens its own total.
+    assert manager.status()["requests"] == {"current": 0, "last": 0}
+    for _ in range(3):
+        manager.counter.record()
+    assert manager.status()["requests"] == {"current": 3, "last": 0}
+    await manager.rotate()
+    # The next connection reports its own total beside the previous one.
+    assert manager.status()["requests"] == {"current": 0, "last": 3}
+    manager.counter.record()
+    assert manager.status()["requests"] == {"current": 1, "last": 3}
+    await manager.close()
+
+
+async def test_request_totals_of_a_tunnel_that_exited_report_as_last(manager):
+    await manager.rotate()
+    manager.counter.record()
+    manager.counter.record()
+    manager.process.returncode = 255
+    # ssh left on its own: its counts are the last connection's, not current.
+    assert manager.status()["requests"] == {"current": 0, "last": 2}
+    await manager.close()
+
+
+async def test_disconnect_keeps_the_finished_total_as_last(manager):
+    await manager.rotate()
+    manager.counter.record()
+    manager.counter.record()
+    assert (await manager.disconnect())["requests"] == {"current": 0, "last": 2}
+    # Reconnecting does not restart the previous connection's total.
+    restarted = await manager.restart()
+    assert restarted["requests"] == {"current": 0, "last": 2}
+    await manager.close()
+
+
 async def test_concurrent_rotation_rejected(manager):
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -838,6 +874,22 @@ def test_startup_echo_reports_the_version(capsys):
 
     _echo_startup(config(), "token", None)
     assert f"Version: {__version__}" in capsys.readouterr().out
+
+
+async def test_status_endpoint_reports_the_proxy_request_counter(manager):
+    await manager.rotate()
+    application = create_app(manager.config, "secret", manager)
+    # The proxy records into the very counter the endpoint reports, so a
+    # request carried over the tunnel shows up without any extra plumbing.
+    assert application.state.http_proxy.counter is manager.counter
+    application.state.http_proxy.counter.record()
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        payload = (await client.get("/status", headers=headers)).json()
+    assert payload["requests"] == {"current": 1, "last": 0}
+    await manager.close()
 
 
 async def test_status_reports_the_package_version(manager):
