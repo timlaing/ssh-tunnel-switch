@@ -83,7 +83,7 @@ Deferred, because they are baked into an already-bound socket, and named in
 
 - `proxy.ip` and `proxy.port`: the running `ssh -D` keeps its socket, and the
   new bind is adopted by the next connection change — `POST /rotate`, or the
-  Alt+R/Ctrl+N/Ctrl+E keys below
+  Alt+R/Ctrl+N/Ctrl+E/Alt+S keys below
 - `api.ip` and `api.port`, and `http_proxy.enabled`, `http_proxy.ip` and
   `http_proxy.port`: these listeners are only created at startup, so they
   require a service restart. The HTTP proxy limits above still apply live.
@@ -121,13 +121,24 @@ cbreak mode, so Ctrl-C is untouched and still stops the service:
 | Ctrl+E | connect to the last server (a hint when already connected)                       |
 | Ctrl+D | stop the tunnel; this also clears the cooldown, so connecting again is immediate |
 | Alt+R  | reconnect to the current server                                                  |
-| Ctrl+N | rotate to the next server                                                        |
+| Ctrl+N | rotate to the next server, without waiting out the cooldown                      |
+| Alt+S  | open a picker over the configured servers and connect to the chosen one          |
 | Ctrl+R | reload the configuration, as `POST /reload` does                                 |
 | Ctrl+C | stop the service (unchanged: SIGINT, normal uvicorn shutdown)                    |
 
-Each connection change goes through the same cooldown and busy checks as the
-API, and a rejection (for example an active cooldown) is reported in the
-panel's last-action row rather than lost.
+The picker lists every configured server with the current one marked, starts
+highlighted on the server the tunnel uses, and closes on Enter (connect to the
+highlighted server) or Esc (change nothing); ↑/↓ or j/k move the highlight. It
+takes over the keyboard while open, so no other key acts until it closes.
+
+Every connection change still passes the busy check, and a rejection (for
+example a rotation already in progress) is reported in the panel's last-action
+row rather than lost. Ctrl+N and Alt+S skip the cooldown — they are deliberate
+requests from the operator watching the panel, so they are refused only while
+another change is running. Alt+R, Ctrl+E and the API keep the cooldown, so a
+rejected key still reports the remaining time. Either way the connected server
+pins the rotation index and is saved to the state file, so a restart bounces
+that same server.
 
 The log path must differ from the YAML and explicitly configured identity files
 and must be a regular file (a directory or FIFO is rejected). At write time the

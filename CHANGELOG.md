@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Let the status panel's rotate key (Ctrl+N) bypass the rotation cooldown: an interactive rotation is a deliberate request from the operator, so it is admitted whenever no other connection change is running. The API, Alt+R and Ctrl+E keep enforcing the cooldown as before.
+- Add a server picker to the status panel: Alt+S lists the configured servers with the current one marked and the highlight starting on it, ↑/↓ or j/k move the highlight, Enter connects to the highlighted server alone (no failover, no cooldown) and Esc cancels. The picker owns the keyboard while open, so other keys do nothing until it closes.
+
 ## 1.3.0 — 2026-10-19
 
 - Apply configuration changes without restarting the service or dropping the tunnel: `serve` watches its YAML file, validates each change and swaps it in while the tunnel keeps running; `POST /reload` and `SIGHUP` (systemd's `ExecReload`) apply the file immediately. A reload that arrives while a rotation is in progress is refused with 429 and picked up again by the watcher once the rotation finishes.

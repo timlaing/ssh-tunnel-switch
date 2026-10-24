@@ -53,10 +53,17 @@ class TunnelManager:
     def busy(self) -> bool:
         return self._busy
 
-    def _admit(self) -> None:
-        """Refuse a connection change while one runs or the cooldown holds."""
+    def _admit(self, cooldown: bool = True) -> None:
+        """Refuse a connection change while one runs or the cooldown holds.
+
+        ``cooldown=False`` keeps the busy gate but skips the backoff: an
+        interactive key is a deliberate request from the person watching the
+        panel, so it must not be refused for having just rotated.
+        """
         if self._busy:
             raise RotationRejected("Tunnel rotation already in progress")
+        if not cooldown:
+            return
         now = time.monotonic()
         if self._last_rotation is not None:
             remaining = self.config.cooldown_seconds - (now - self._last_rotation)
@@ -171,16 +178,47 @@ class TunnelManager:
                     "SOCKS bind address is already occupied or unavailable"
                 ) from exc
 
-    async def rotate(self, pre_connect: Callable[[], None] | None = None) -> dict:
+    async def rotate(
+        self,
+        pre_connect: Callable[[], None] | None = None,
+        *,
+        ignore_cooldown: bool = False,
+    ) -> dict:
         """Connect through the next server, falling back to the rest of the list.
 
         ``pre_connect`` runs once the rotation is admitted and before the
         first await, so admission and the deferred SOCKS bind adoption it
         unlocks are one atomic step in the service event loop.
+        ``ignore_cooldown`` skips the cooldown but keeps the busy gate, which
+        is what the interactive rotate key uses.
         """
         # No await before admission: atomic within the single service event loop.
-        self._admit()
+        self._admit(cooldown=not ignore_cooldown)
         return await self._change(self._rotate_across_servers, pre_connect)
+
+    async def select_server(
+        self,
+        name: str,
+        pre_connect: Callable[[], None] | None = None,
+    ) -> dict:
+        """Connect through one named server, without trying the others.
+
+        An explicit choice skips the cooldown for the same reason as
+        ``ignore_cooldown`` on rotate(): the operator picked that server, so
+        it either comes up or its failure is reported. No failover runs —
+        connecting elsewhere would not be the selection that was asked for.
+        """
+        servers = self.config.servers
+        server = next((s for s in servers if s.name == name), None)
+        if server is None:
+            raise ValueError(
+                f"Unknown server: {name}. Choose one of: "
+                f"{', '.join(s.name for s in servers)}"
+            )
+        self._admit(cooldown=False)
+        return await self._change(
+            lambda: self._connect_selected(servers.index(server)), pre_connect
+        )
 
     async def restart(self, pre_connect: Callable[[], None] | None = None) -> dict:
         """Reconnect to the server the rotation index currently names.
@@ -270,26 +308,7 @@ class TunnelManager:
                         )
                     await self._stop()
                     continue
-                self._connection = (
-                    str(uuid4()),
-                    datetime.now(timezone.utc),
-                    server.name,
-                )
-                # The tunnel is up: failing to persist the selection must not
-                # move on to another server, since the same state file would fail.
-                try:
-                    await self._remember_server(server)
-                except Exception as exc:
-                    self.last_error = str(exc)
-                    logger.exception(
-                        "Tunnel connected to SSH server %s but saving its state failed",
-                        server.name,
-                    )
-                    await self._stop()
-                    raise TunnelFailure(str(exc)) from exc
-                logger.info(
-                    "Tunnel connected to SSH server %s (%s)", server.name, server.host
-                )
+                await self._adopt(server)
                 return
             _, last = failures[-1]
             self.last_error = str(last)
@@ -303,6 +322,49 @@ class TunnelManager:
             # Cancellation during connect or state save must not leave a tunnel.
             await self._stop()
             raise
+
+    async def _connect_selected(self, index: int) -> None:
+        """Connect to the server at ``index`` alone: no advance, no failover.
+
+        The index is pinned first so a restart() after this selection bounces
+        the same server instead of moving on.
+        """
+        server = self.config.servers[index]
+        self._index = index
+        # From here on a restart pins this index instead of advancing one.
+        self._attempted = True
+        try:
+            await self._connect(server)
+        except asyncio.CancelledError:
+            await self._stop()
+            raise
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("Tunnel selection of server %s failed", server.name)
+            await self._stop()
+            raise TunnelFailure(str(exc)) from exc
+        await self._adopt(server)
+
+    async def _adopt(self, server: Server) -> None:
+        """Publish the new connection and persist the selection."""
+        self._connection = (
+            str(uuid4()),
+            datetime.now(timezone.utc),
+            server.name,
+        )
+        # The tunnel is up: failing to persist the selection must not
+        # move on to another server, since the same state file would fail.
+        try:
+            await self._remember_server(server)
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception(
+                "Tunnel connected to SSH server %s but saving its state failed",
+                server.name,
+            )
+            await self._stop()
+            raise TunnelFailure(str(exc)) from exc
+        logger.info("Tunnel connected to SSH server %s (%s)", server.name, server.host)
 
     async def _connect(self, server: Server):
         """Start SSH for *server* and wait until it proxies, or raise."""
