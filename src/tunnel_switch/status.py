@@ -117,8 +117,20 @@ def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
         ("Server", status["server"] or "-"),
         ("Connection", f"{connection} ({status['server']})" if connection else "-"),
         ("Started", started),
-        ("SOCKS proxy", _endpoint(status["proxy"]["ip"], status["proxy"]["port"])),
     ]
+    # The counter only exists in a live status dict: a caller that builds one
+    # by hand (a test, an older client) simply gets no request row.
+    requests = status.get("requests")
+    if requests is not None:
+        rows.append(
+            (
+                "HTTP requests",
+                f"{requests['current']} current · [dim]{requests['last']} last[/dim]",
+            )
+        )
+    rows.append(
+        ("SOCKS proxy", _endpoint(status["proxy"]["ip"], status["proxy"]["port"]))
+    )
     if config.http_proxy.enabled:
         rows.append(
             ("HTTP proxy", _endpoint(config.http_proxy.ip, config.http_proxy.port))

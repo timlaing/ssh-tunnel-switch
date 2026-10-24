@@ -250,6 +250,19 @@ def test_status_panel_renders_state_server_and_error(tmp_path):
     assert "SSH exited with code 255" in rendered(cfg, error)
 
 
+def test_status_panel_shows_the_request_totals_per_connection():
+    cfg = config(http_proxy={"enabled": True, "port": 8118})
+    counted = {**status(), "requests": {"current": 12, "last": 3}}
+    text = rendered(cfg, counted)
+    assert "HTTP requests" in text
+    assert "12 current" in text
+    assert "3 last" in text
+    # A status dict without the counter keeps the rest of the panel intact.
+    plain = rendered(cfg, status())
+    assert "HTTP requests" not in plain
+    assert "9d7e9746 (one)" in plain
+
+
 def test_status_display_renders_until_stop_event(tmp_path):
     from io import StringIO
     from threading import Event, Thread
