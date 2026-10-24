@@ -110,15 +110,17 @@ def key_actions(application, manager, panel_state):
 
     The display thread cannot await, so each key schedules its coroutine on the
     service event loop and records the outcome (or the rejection, such as an
-    active cooldown) as the panel's last action.
+    active cooldown) as the panel's last action. Actions take arguments when
+    the key resolves a choice: the server picker passes the server to connect
+    to.
     """
 
     def submit(name, run):
-        def dispatch():
+        def dispatch(*args):
             loop = getattr(application.state, "loop", None)
             if loop is None or loop.is_closed():
                 return
-            future = asyncio.run_coroutine_threadsafe(run(), loop)
+            future = asyncio.run_coroutine_threadsafe(run(*args), loop)
 
             def done(completed):
                 try:
@@ -158,8 +160,16 @@ def key_actions(application, manager, panel_state):
         return f"restart: {manager.status()['server']}"
 
     async def rotate():
-        await manager.rotate(pending_bind())
+        # A key press is a deliberate request from the operator watching the
+        # panel, so the cooldown backoff gates the API, not this key.
+        await manager.rotate(pending_bind(), ignore_cooldown=True)
         return f"rotate: {manager.status()['server']}"
+
+    async def select(server_name):
+        # The picker already asked for one server by name: no failover, no
+        # cooldown — it comes up or its failure is reported as-is.
+        await manager.select_server(server_name, pending_bind())
+        return f"select: {manager.status()['server']}"
 
     async def disconnect():
         await manager.disconnect()
@@ -171,6 +181,7 @@ def key_actions(application, manager, panel_state):
         "disconnect": submit("disconnect", disconnect),
         "restart": submit("restart", restart),
         "rotate": submit("rotate", rotate),
+        "select": submit("select", select),
     }
 
 

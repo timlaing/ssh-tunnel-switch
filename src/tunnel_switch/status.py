@@ -2,9 +2,14 @@
 
 The display owns one daemon thread: it renders the panel and, when stdin is a
 terminal, reads single key presses (reload, connect, disconnect, restart,
-rotate). Keys run as coroutines on the service event loop; the terminal is put
-in cbreak mode so single keys arrive without echoing while ``ISIG`` stays
-enabled, keeping Ctrl-C a normal SIGINT for uvicorn's shutdown.
+rotate, select server). Keys run as coroutines on the service event loop; the
+terminal is put in cbreak mode so single keys arrive without echoing while
+``ISIG`` stays enabled, keeping Ctrl-C a normal SIGINT for uvicorn's shutdown.
+
+The select key opens an inline picker instead of dispatching at once: the
+panel lists every configured server, arrow keys (or ``j``/``k``) move the
+highlight, Enter hands the highlighted server to the select action and Esc
+closes the picker without changing anything.
 """
 
 from datetime import datetime, timezone
@@ -24,11 +29,23 @@ from .config import Config
 REFRESH_SECONDS = 0.5
 ESCAPE_WAIT_SECONDS = 0.05
 STATE_STYLES = {"connected": "green", "rotating": "yellow", "disconnected": "red"}
-KEYS = {b"\x12": "reload", b"\x05": "connect", b"\x04": "disconnect", b"\x0e": "rotate"}
+KEYS = {
+    b"\x12": "reload",
+    b"\x05": "connect",
+    b"\x04": "disconnect",
+    b"\x0e": "rotate",
+    b"\x1bs": "select",
+}
 FOOTER = (
-    "Ctrl+R: reload config · Alt+R: restart tunnel",
+    "Ctrl+R: reload config · Alt+R: restart tunnel · Alt+S: select server",
     "Ctrl+N: rotate server · Ctrl+E: connect · Ctrl+D: disconnect · Ctrl+C: quit",
 )
+PICKER_FOOTER = (
+    "↑/↓ or j/k: highlight · Enter: connect to the highlighted server · Esc: cancel",
+)
+# Picker navigation, matched as one complete read: arrows and j/k move the
+# highlight, Enter and Esc resolve it. Every other byte is ignored.
+PICKER_KEYS = {b"\x1b[A": -1, b"k": -1, b"\x1b[B": 1, b"j": 1}
 
 
 def decode_key(sequence: bytes) -> str | None:
@@ -48,6 +65,8 @@ class PanelState:
     def __init__(self):
         self.last_reload = None
         self.last_action = None
+        # Highlighted row of the open server picker; None while it is closed.
+        self.picker_index = None
 
 
 def _endpoint(ip, port: int) -> str:
@@ -66,6 +85,24 @@ def _elapsed(started_at: str | None) -> str:
     if seconds < 3600:
         return f"{seconds // 60}m {seconds % 60}s"
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+def _server_picker(config: Config, status: dict, state: PanelState) -> Group:
+    """List the configured servers, marking the highlighted and current one."""
+    current = status["server"]
+    lines = [Text("Select server", style="bold")]
+    for index, server in enumerate(config.servers):
+        picked = index == state.picker_index
+        host = "" if server.host == server.name else f" ({server.host})"
+        marker = "❯ " if picked else "  "
+        note = " · current" if server.name == current else ""
+        lines.append(
+            Text(
+                f"{marker}{server.name}{host}{note}",
+                style="bold" if picked else "dim",
+            )
+        )
+    return Group(*lines)
 
 
 def status_panel(
@@ -108,9 +145,17 @@ def status_panel(
     if status["last_error"]:
         table.add_row("Last error", f"[red]{status['last_error']}[/]")
     body = [table]
-    if keys:
-        body.append(Text(FOOTER[0], style="dim"))
-        body.append(Text(FOOTER[1], style="dim"))
+    picking = state is not None and state.picker_index is not None
+    if keys and picking:
+        # The picker takes over the footer: the normal keys mean nothing until
+        # the open choice is confirmed or cancelled.
+        body.append(_server_picker(config, status, state))
+        footer = PICKER_FOOTER
+    elif keys:
+        footer = FOOTER
+    else:
+        footer = ()
+    body.extend(Text(line, style="dim") for line in footer)
     return Panel(
         Group(*body),
         title=f"SSH Tunnel Switch {__version__}",
@@ -151,7 +196,46 @@ def _key_reader():
     return descriptor, restore
 
 
-def _handle_keys(descriptor: int, actions, state: PanelState) -> None:
+def _dispatch(run, state: PanelState, action: str, *args) -> None:
+    """Run one key action, reporting a failed dispatch in the panel."""
+    try:
+        run(*args)
+    except OSError as exc:
+        state.last_action = f"{action}: {exc}"
+
+
+def _open_picker(state: PanelState, manager) -> None:
+    """Highlight the server the tunnel uses, or the one a rotation would pick."""
+    current = manager.status()["server"]
+    state.picker_index = next(
+        (
+            index
+            for index, server in enumerate(manager.config.servers)
+            if server.name == current
+        ),
+        0,
+    )
+
+
+def _handle_picker(sequence: bytes, actions, state: PanelState, manager) -> None:
+    """Move the highlight, or hand the chosen server to the select action."""
+    servers = manager.config.servers if manager is not None else []
+    step = PICKER_KEYS.get(sequence)
+    if step is not None and servers:
+        state.picker_index = (state.picker_index + step) % len(servers)
+    elif sequence in (b"\r", b"\n"):
+        index = state.picker_index
+        # A reload may have shrunk the list while the picker was open, so the
+        # highlight is validated before it names a server.
+        chosen = servers[index] if 0 <= index < len(servers) else None
+        state.picker_index = None
+        if chosen is not None and actions is not None and "select" in actions:
+            _dispatch(actions["select"], state, "select", chosen.name)
+    elif sequence == b"\x1b":
+        state.picker_index = None
+
+
+def _handle_keys(descriptor: int, actions, state: PanelState, manager=None) -> None:
     sequence = os.read(descriptor, 32)
     # Alt+R may arrive as ESC and "r" in separate reads.
     if (
@@ -159,13 +243,19 @@ def _handle_keys(descriptor: int, actions, state: PanelState) -> None:
         and select.select([descriptor], [], [], ESCAPE_WAIT_SECONDS)[0]
     ):
         sequence += os.read(descriptor, 8)
+    if state.picker_index is not None:
+        _handle_picker(sequence, actions, state, manager)
+        return
     action = decode_key(sequence)
+    if action == "select":
+        # Opening the picker belongs to this display thread; only the server
+        # confirmed inside it is dispatched to the event loop.
+        if manager is not None and actions is not None and "select" in actions:
+            _open_picker(state, manager)
+        return
     if action is None or actions is None or action not in actions:
         return
-    try:
-        actions[action]()
-    except OSError as exc:
-        state.last_action = f"{action}: {exc}"
+    _dispatch(actions[action], state, action)
 
 
 def run_status_display(
@@ -207,6 +297,6 @@ def run_status_display(
                 if stop.is_set():
                     break
                 if readable:
-                    _handle_keys(descriptor, actions, state)
+                    _handle_keys(descriptor, actions, state, manager)
     finally:
         restore()

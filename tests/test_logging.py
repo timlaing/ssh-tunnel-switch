@@ -310,7 +310,14 @@ def test_serve_shows_status_display_on_tty(tmp_path, monkeypatch, capsys, root_l
     )
     serve(path)
     assert seen["log"] == tmp_path / "service.log"
-    assert seen["actions"] == ["connect", "disconnect", "reload", "restart", "rotate"]
+    assert seen["actions"] == [
+        "connect",
+        "disconnect",
+        "reload",
+        "restart",
+        "rotate",
+        "select",
+    ]
     # uvicorn keeps the main thread while the display runs alongside it.
     assert len(runs) == 1
     assert runs[0]["log_config"] is None

@@ -420,6 +420,7 @@ async def test_reload_rotates_the_bearer_token(yaml_file):
         (b"\x0e", "rotate"),  # Ctrl+N
         (b"\x05", "connect"),  # Ctrl+E
         (b"\x04", "disconnect"),  # Ctrl+D
+        (b"\x1bs", "select"),  # Alt+S
         (b"x\x12", "reload"),  # A key read may carry extra bytes.
     ],
 )
@@ -447,10 +448,26 @@ def test_status_panel_shows_feedback_and_the_key_footer():
     assert "rotate: two" in with_keys
     assert "Ctrl+R: reload config" in with_keys
     assert "Ctrl+N: rotate server" in with_keys
+    assert "Alt+S: select server" in with_keys
     without_keys = rendered(cfg, state=state)
     assert "Ctrl+R" not in without_keys
     # Without feedback the rows are omitted entirely.
     assert "Last reload" not in rendered(cfg)
+
+
+def test_status_panel_renders_the_open_server_picker():
+    cfg = config()
+    state = PanelState()
+    state.picker_index = 1
+    picking = rendered(cfg, state=state, keys=True, server="one")
+    assert "Select server" in picking
+    assert "❯ two" in picking
+    assert "· current" in picking  # The connected server is named in the list.
+    assert "Enter: connect" in picking
+    # The picker replaces the ordinary keys while it owns the keyboard.
+    assert "Ctrl+N: rotate server" not in picking
+    # Nothing could confirm a list without terminal keys, so it stays hidden.
+    assert "Select server" not in rendered(cfg, state=state)
 
 
 def test_status_panel_title_carries_the_version():
@@ -459,7 +476,7 @@ def test_status_panel_title_carries_the_version():
     assert f"SSH Tunnel Switch {__version__}" in rendered(config())
 
 
-def rendered(cfg, state=None, keys=False):
+def rendered(cfg, state=None, keys=False, server=None):
     from io import StringIO
     from rich.console import Console
 
@@ -467,7 +484,7 @@ def rendered(cfg, state=None, keys=False):
         "state": "disconnected",
         "connection_id": None,
         "started_at": None,
-        "server": None,
+        "server": server,
         "proxy": {"ip": "127.0.0.1", "port": 1080},
         "last_error": None,
     }
@@ -487,7 +504,14 @@ async def test_connect_key_is_a_hint_when_already_connected(manager):
         state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
     )
     actions = key_actions(application, manager, panel)
-    assert sorted(actions) == ["connect", "disconnect", "reload", "restart", "rotate"]
+    assert sorted(actions) == [
+        "connect",
+        "disconnect",
+        "reload",
+        "restart",
+        "rotate",
+        "select",
+    ]
     actions["connect"]()
     await until(lambda: panel.last_action is not None)
     assert panel.last_action == "already connected to one; Alt+R restarts it"
@@ -544,6 +568,52 @@ async def test_restart_key_reports_the_remaining_cooldown(manager):
     await manager.close()
 
 
+async def test_rotate_key_skips_the_cooldown(manager):
+    from tunnel_switch.cli import key_actions
+
+    manager.config.cooldown_seconds = 30
+    await manager.rotate()
+    panel = PanelState()
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
+    )
+    actions = key_actions(application, manager, panel)
+    actions["rotate"]()
+    await until(lambda: panel.last_action is not None)
+    # The API answers 429 here; the key the operator just pressed does not.
+    assert panel.last_action == "rotate: two"
+    await manager.close()
+
+
+async def test_select_key_connects_to_the_chosen_server(manager):
+    from tunnel_switch.cli import key_actions
+
+    panel = PanelState()
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
+    )
+    actions = key_actions(application, manager, panel)
+    actions["select"]("two")
+    await until(lambda: panel.last_action is not None)
+    assert panel.last_action == "select: two"
+    assert manager.status()["server"] == "two"
+    await manager.close()
+
+
+async def test_select_key_reports_an_unknown_server(manager):
+    from tunnel_switch.cli import key_actions
+
+    panel = PanelState()
+    application = SimpleNamespace(
+        state=SimpleNamespace(loop=asyncio.get_running_loop(), reloader=None)
+    )
+    actions = key_actions(application, manager, panel)
+    actions["select"]("missing")
+    await until(lambda: panel.last_action is not None)
+    assert panel.last_action.startswith("select: Unknown server: missing")
+    await manager.close()
+
+
 async def test_key_actions_run_and_feed_the_panel(manager):
     """Every key reports its outcome, whatever the tunnel does."""
     from tunnel_switch.cli import key_actions
@@ -554,14 +624,15 @@ async def test_key_actions_run_and_feed_the_panel(manager):
     panel = PanelState()
     actions = key_actions(application, manager, panel)
     expected = [
-        ("reload", "reload: no configuration file was given to the service"),
-        ("rotate", "rotate: one"),
-        ("restart", "restart: one"),
-        ("disconnect", "disconnect: tunnel stopped"),
+        ("reload", "reload: no configuration file was given to the service", ()),
+        ("rotate", "rotate: one", ()),
+        ("restart", "restart: one", ()),
+        ("disconnect", "disconnect: tunnel stopped", ()),
+        ("select", "select: two", ("two",)),
     ]
-    for name, message in expected:
+    for name, message, args in expected:
         panel.last_action = None
-        actions[name]()
+        actions[name](*args)
         await until(lambda: panel.last_action is not None)
         assert panel.last_action == message
     await manager.close()
@@ -995,6 +1066,89 @@ def test_handle_keys_reports_a_failing_action(monkeypatch):
     state = PanelState()
     status._handle_keys(0, {"connect": refuse}, state)
     assert state.last_action == "connect: no keyboard"
+
+
+def test_handle_keys_opens_moves_and_confirms_the_picker(monkeypatch, manager):
+    from tunnel_switch import status
+
+    picked = []
+    actions = {"select": lambda name: picked.append(name)}
+    state = PanelState()
+    reads = iter([b"\x1bs", b"\x1b[B", b"\r"])  # Alt+S, arrow down, Enter
+    monkeypatch.setattr(status.os, "read", lambda fd, n: next(reads))
+    status._handle_keys(0, actions, state, manager)
+    assert state.picker_index == 0  # Nothing connects yet: the first server.
+    status._handle_keys(0, actions, state, manager)
+    assert state.picker_index == 1
+    status._handle_keys(0, actions, state, manager)
+    assert state.picker_index is None
+    assert picked == ["two"]
+
+
+async def test_handle_keys_opens_the_picker_on_the_connected_server(
+    monkeypatch, manager
+):
+    from tunnel_switch import status
+
+    await manager.rotate()
+    await manager.rotate()
+    state = PanelState()
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x1bs")
+    status._handle_keys(0, {"select": lambda name: None}, state, manager)
+    assert state.picker_index == 1  # Highlighted on the connected server "two".
+    await manager.close()
+
+
+def test_handle_keys_picker_owns_the_keyboard(monkeypatch, manager):
+    from tunnel_switch import status
+
+    state = PanelState()
+    state.picker_index = 0
+    rotated, picked = [], []
+    # While the picker is open, a rotation key is ignored rather than acted on.
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x0e")
+    status._handle_keys(0, {"rotate": lambda: rotated.append(1)}, state, manager)
+    assert rotated == []
+    assert state.picker_index == 0
+    # Esc closes the picker without connecting anywhere.
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x1b")
+    monkeypatch.setattr(status.select, "select", lambda *args: ([], [], []))
+    status._handle_keys(0, {"select": lambda name: picked.append(name)}, state, manager)
+    assert state.picker_index is None
+    assert picked == []
+
+
+def test_handle_keys_ignores_picker_bytes_it_does_not_know(monkeypatch, manager):
+    from tunnel_switch import status
+
+    state = PanelState()
+    state.picker_index = 0
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"z")
+    status._handle_keys(0, {"select": lambda name: None}, state, manager)
+    assert state.picker_index == 0  # Still open, still on the first server.
+
+
+def test_handle_keys_never_opens_a_picker_it_could_not_confirm(monkeypatch):
+    from tunnel_switch import status
+
+    # Without a manager there is no server list to offer or confirm from.
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\x1bs")
+    state = PanelState()
+    status._handle_keys(0, {"select": lambda name: None}, state)
+    assert state.picker_index is None
+
+
+def test_handle_keys_closes_a_picker_whose_highlight_went_stale(monkeypatch, manager):
+    from tunnel_switch import status
+
+    # A reload shrank the list to two servers while the picker was open.
+    state = PanelState()
+    state.picker_index = 5
+    picked = []
+    monkeypatch.setattr(status.os, "read", lambda fd, n: b"\r")
+    status._handle_keys(0, {"select": lambda name: picked.append(name)}, state, manager)
+    assert state.picker_index is None
+    assert picked == []  # The stale highlight names nothing, so nothing runs.
 
 
 def test_display_reads_keys_until_stop(monkeypatch):

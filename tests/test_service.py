@@ -142,6 +142,93 @@ async def test_restart_fails_over_when_the_current_server_refuses(manager, monke
     await manager.close()
 
 
+async def test_select_server_connects_to_the_named_server(manager):
+    await manager.rotate()
+    assert (await manager.select_server("two"))["server"] == "two"
+    # The selection pins the index, so a restart bounces the chosen server.
+    assert (await manager.restart())["server"] == "two"
+    assert (await manager.select_server("one"))["server"] == "one"
+    await manager.close()
+
+
+async def test_select_server_rejects_an_unknown_name(manager):
+    with pytest.raises(ValueError, match="Unknown server: missing"):
+        await manager.select_server("missing")
+    # A refused selection never reaches the admission gate or the tunnel.
+    assert not manager.busy
+    await manager.rotate()
+    assert manager.status()["server"] == "one"
+    await manager.close()
+
+
+async def test_select_server_skips_the_cooldown_but_not_a_running_change(manager):
+    manager.config.cooldown_seconds = 30
+    await manager.rotate()
+    with pytest.raises(RotationRejected, match="cooldown"):
+        await manager.rotate()
+    # An explicit choice is a deliberate request, so the backoff does not apply.
+    assert (await manager.select_server("two"))["server"] == "two"
+    manager._busy = True
+    with pytest.raises(RotationRejected, match="in progress"):
+        await manager.select_server("one")
+    manager._busy = False
+    await manager.close()
+
+
+async def test_select_server_reports_a_failure_without_failing_over(
+    manager, monkeypatch
+):
+    manager.config.cooldown_seconds = 30
+    await manager.rotate()
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=lambda *args, **kwargs: exited_ssh()),
+    )
+    with pytest.raises(TunnelFailure, match="SSH exited with code 255"):
+        await manager.select_server("two")
+    # The named server failed, so the tunnel stays down instead of moving on.
+    status = manager.status()
+    assert status["state"] == "disconnected"
+    assert status["server"] is None
+    assert manager.process is None
+    await manager.close()
+
+
+async def test_rotate_ignores_the_cooldown_when_asked(manager):
+    manager.config.cooldown_seconds = 30
+    await manager.rotate()
+    with pytest.raises(RotationRejected, match="cooldown"):
+        await manager.rotate()
+    # This flag is what the interactive rotate key passes; the API never does.
+    assert (await manager.rotate(ignore_cooldown=True))["server"] == "two"
+    # Only the backoff is skipped: a change already running still refuses.
+    manager._busy = True
+    with pytest.raises(RotationRejected, match="in progress"):
+        await manager.rotate(ignore_cooldown=True)
+    manager._busy = False
+    await manager.close()
+
+
+async def test_cancelled_selection_cleans_up(manager):
+    """Cancellation mid-selection must not leave a half-started tunnel."""
+    entered = asyncio.Event()
+
+    async def ready():
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager._ready = ready
+    task = asyncio.create_task(manager.select_server("two"))
+    await entered.wait()
+    process = manager.process
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.terminated
+    assert manager.process is None
+
+
 async def test_disconnect_stops_the_tunnel_and_clears_the_cooldown(manager):
     manager.config.cooldown_seconds = 30
     await manager.rotate()
