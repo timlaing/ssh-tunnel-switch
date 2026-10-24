@@ -943,8 +943,9 @@ async def test_proxy_records_only_while_the_adopted_tunnel_runs(manager):
 def test_create_app_refuses_a_manager_beside_a_separate_counter(manager):
     # The proxy records into the manager's counter, so a second counter would
     # silently collect nothing: say so instead of reporting wrong totals.
+    duplicate = RequestCounter()
     with pytest.raises(ValueError, match="not both"):
-        create_app(manager.config, "secret", manager, counter=RequestCounter())
+        create_app(manager.config, "secret", manager, counter=duplicate)
 
 
 def test_create_app_gives_a_supplied_counter_to_the_manager_it_builds():
