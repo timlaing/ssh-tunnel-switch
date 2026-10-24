@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import threading
 from unittest.mock import AsyncMock
 import httpx
 import pytest
@@ -125,6 +126,40 @@ async def test_disconnect_keeps_the_finished_total_as_last(manager):
     # Reconnecting does not restart the previous connection's total.
     restarted = await manager.restart()
     assert restarted["requests"] == {"current": 0, "last": 2}
+    await manager.close()
+
+
+async def test_status_pairs_the_totals_with_the_connection_they_belong_to(manager):
+    await manager.rotate()
+    for _ in range(3):
+        manager.counter.record()
+    first = manager.status()
+    first_id = first["connection_id"]
+    assert first["requests"] == {"current": 3, "last": 0}
+    observed = []
+    stop = threading.Event()
+
+    def read_status():
+        while not stop.is_set():
+            observed.append(manager.status())
+
+    reader = threading.Thread(target=read_status, daemon=True)
+    reader.start()
+    try:
+        # Rotations publish new connections while status() reads, which is the
+        # moment a read could straddle the two: the ID of the old connection
+        # beside the totals the new one has already taken over.
+        for _ in range(25):
+            await manager.rotate()
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+    assert observed, "the reading thread never observed a status"
+    for seen in observed:
+        if seen["connection_id"] == first_id:
+            assert seen["requests"] == {"current": 3, "last": 0}
+        if seen["connection_id"] is None:
+            assert seen["requests"]["current"] == 0
     await manager.close()
 
 

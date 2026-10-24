@@ -3,7 +3,10 @@
 The proxy records on the service event loop while the display thread reads
 ``snapshot()``, so the values are plain integers: an attribute read or write
 of an int is atomic under the GIL, and only one thread ever increments, so no
-lock is needed to keep the two totals coherent.
+lock is needed to keep the two totals coherent. The one mutation that moves
+totals between the buckets, ``begin()``, runs on the event loop under the
+manager's state lock — the same lock ``status()`` holds while reading the
+pair — so a rotation can never be caught halfway through moving them.
 """
 
 
