@@ -42,7 +42,7 @@ Edit the SSH host aliases in the YAML. Verify host keys and key/agent authentica
 .venv/bin/tunnel-switch serve --config config.yaml
 ```
 
-Startup generates and saves an API token if needed and prints it to the console. Keep the configuration and logs private. On an interactive terminal `serve` shows a live status panel while timestamped service and access logs are written to the log file (`logging.file`); when run under systemd the timestamped lines also reach the journal. By default the SOCKS5 listener is `127.0.0.1:1080`, the HTTP proxy is `127.0.0.1:8118`, and the REST API is `127.0.0.1:8765`.
+Startup generates and saves an API token if needed and prints it to the console. Keep the configuration and logs private. On an interactive terminal `serve` shows a live status panel while timestamped service and access logs are written to the log file (`logging.file`); when run under systemd the timestamped lines also reach the journal. By default the SOCKS5 listener is `127.0.0.1:1080`, the HTTP proxy is `127.0.0.1:8118`, and the REST API is `127.0.0.1:8765`. The panel also carries an `HTTP requests` row with the requests the proxy sent over the current SSH connection and over the one before it, described under [Use the proxy](#use-the-proxy).
 
 The service watches its YAML and applies configuration changes without restarting or dropping the tunnel (`systemctl reload` or `POST /reload` trigger it immediately). On an interactive terminal the status panel also responds to keys: Ctrl+R reloads the configuration, Ctrl+E connects, Ctrl+D disconnects, Alt+R restarts the current server, Ctrl+N rotates to the next, Alt+S opens a picker over the configured servers so you can connect to a chosen one, and Ctrl+C still stops the service. The rotation cooldown still gates the API, Alt+R and Ctrl+E, but not the two deliberate keys Ctrl+N and Alt+S. The panel title shows the running version, which is also reported by `tunnel-switch --version`, the `serve` startup banner and `GET /status`.
 
@@ -55,6 +55,8 @@ curl --proxy http://127.0.0.1:8118 https://example.com/
 ```
 
 Proxy-aware applications can use `HTTP_PROXY` and `HTTPS_PROXY` set to `http://127.0.0.1:8118`; set `NO_PROXY=localhost,127.0.0.1,::1` for direct local control calls. SOCKS-aware clients can use `socks5h://127.0.0.1:1080` directly. HTTPS remains encrypted end to end. Forwarding fails when SOCKS is unavailable and never falls back to a direct destination connection.
+
+Every request the proxy carries is counted: a forwarded request and a CONNECT each count once, while a request the tunnel could not carry counts nowhere and the encrypted requests inside a CONNECT tunnel cannot be seen at all. The totals are shown in the status panel's `HTTP requests` row and reported by `GET /status` as `requests.current` for the current SSH connection and `requests.last` for the connection before it.
 
 The bearer token protects the REST API only. HTTP and SOCKS proxy listeners are unauthenticated: retain loopback defaults or restrict access with a firewall. Protect remote REST access with TLS. See the [security policy](SECURITY.md).
 

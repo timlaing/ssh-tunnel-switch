@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 import logging
 import socket
 import time
+from threading import Lock
 from uuid import uuid4
 from .config import Config, Server
+from .counters import RequestCounter
 from .state import load_last_server, save_last_server
 
 logger = logging.getLogger(__name__)
@@ -21,14 +23,28 @@ class TunnelFailure(Exception):
     pass
 
 
+def _running(process) -> bool:
+    """Whether an SSH process was started and has not exited yet."""
+    return process is not None and process.returncode is None
+
+
 class TunnelManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, counter: RequestCounter | None = None):
         self.config = config
+        # Shared with the HTTP proxy, which records into it while status()
+        # reports it: the request totals belong to the connection lifecycle
+        # this class owns, so they are read from here.
+        self.counter = counter or RequestCounter()
         self.process = None
         # (connection_id, started_at, server_name) published as one immutable
         # snapshot: the status display thread reads it while rotate()/_stop()
         # write, so a torn read would mix values from different lifecycles.
         self._connection = None
+        # Guards everything status() reports against the writes that publish a
+        # connection, so one status() call describes one instant instead of
+        # straddling a rotation: the display thread and the service loop share
+        # it, and it is never held across an await.
+        self._state_lock = Lock()
         self.last_error = None
         remembered = next(
             (
@@ -53,6 +69,16 @@ class TunnelManager:
     def busy(self) -> bool:
         return self._busy
 
+    def adopted(self) -> bool:
+        """Whether the connection this manager adopted is the one running.
+
+        The HTTP proxy asks before recording a request: while no adopted
+        tunnel serves the SOCKS port, whatever answers on it belongs to some
+        other listener, and its requests are not this tunnel's to count.
+        """
+        with self._state_lock:
+            return _running(self.process) and self._connection is not None
+
     def _admit(self, cooldown: bool = True) -> None:
         """Refuse a connection change while one runs or the cooldown holds.
 
@@ -73,12 +99,19 @@ class TunnelManager:
                 )
 
     def status(self) -> dict:
-        process = self.process
-        alive = process is not None and process.returncode is None
+        # One lock-guarded read: the liveness check, the connection snapshot
+        # and the counter snapshot describe the same instant, so ssh exiting
+        # or a rotation publishing a new connection cannot leave the totals
+        # labelled by a different connection than the fields beside them.
+        with self._state_lock:
+            process = self.process
+            alive = _running(process)
+            connection = self._connection
+            requests = self.counter.snapshot(active=alive and connection is not None)
         state = "connected" if alive else "disconnected"
         if self._busy:
             state = "rotating"
-        connection_id, started_at, server_name = self._connection or (None, None, None)
+        connection_id, started_at, server_name = connection or (None, None, None)
         if not alive:
             connection_id = started_at = server_name = None
         return {
@@ -88,6 +121,10 @@ class TunnelManager:
             "server": server_name,
             "proxy": self.config.proxy.model_dump(mode="json"),
             "last_error": self.last_error,
+            # Only the adopted connection that is still running may own the
+            # current request total; a rotation in between or a tunnel that
+            # exited on its own reports its counts as the last total instead.
+            "requests": requests,
         }
 
     def command(self, server: Server) -> list[str]:
@@ -141,8 +178,9 @@ class TunnelManager:
                 except ProcessLookupError:
                     pass
                 await process.wait()
-        self.process = None
-        self._connection = None
+        with self._state_lock:
+            self.process = None
+            self._connection = None
 
     async def _ready(self):
         ip = str(self.config.proxy.ip)
@@ -347,11 +385,17 @@ class TunnelManager:
 
     async def _adopt(self, server: Server) -> None:
         """Publish the new connection and persist the selection."""
-        self._connection = (
-            str(uuid4()),
-            datetime.now(timezone.utc),
-            server.name,
-        )
+        # Published and the totals reopened as one step: a status() reading
+        # between the two would pair the new connection with the old counts.
+        with self._state_lock:
+            self._connection = (
+                str(uuid4()),
+                datetime.now(timezone.utc),
+                server.name,
+            )
+            # The new connection owns the request totals from here on: the
+            # counts the previous one collected become the last value shown.
+            self.counter.begin()
         # The tunnel is up: failing to persist the selection must not
         # move on to another server, since the same state file would fail.
         try:
@@ -370,12 +414,14 @@ class TunnelManager:
         """Start SSH for *server* and wait until it proxies, or raise."""
         await self._stop()
         self._ensure_socket_free()
-        self.process = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             *self.command(server),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        with self._state_lock:
+            self.process = process
         await self._wait_until_ready()
 
     async def _wait_until_ready(self):

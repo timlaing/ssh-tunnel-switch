@@ -103,7 +103,8 @@ file logging. `logging.level` filters the service and Uvicorn loggers; valid
 levels are `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`.
 
 On an interactive terminal, `serve` shows a live status panel (state, server,
-connection ID shown as `<id> (<server name>)`, elapsed time, proxy addresses
+connection ID shown as `<id> (<server name>)`, elapsed time, the HTTP request
+totals for the current and the previous connection, proxy addresses
 and the last error) instead of console log lines:
 routine records reach only the file, while warnings and errors still print to
 stderr, so failures such as a port bind error remain visible even with
@@ -201,11 +202,23 @@ contacting the service; the same version answers in `GET /status` (`version`),
 in the status panel title and on the `serve` startup banner, so a running
 service can always be matched to the package that produced it.
 
-| Endpoint       | Result                                                                                                                                                                                                                     |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /status`  | Package version, state, connection ID, start time, server, SOCKS and HTTP proxy addresses, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes)              |
-| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                             |
-| `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `refused`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file |
+| Endpoint       | Result                                                                                                                                                                                                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /status`  | Package version, state, connection ID, start time, server, SOCKS and HTTP proxy addresses, the `requests` totals for the current and previous connection, last error, and the `config_reload` block (watch state, config path, last reload, last error and deferred changes) |
+| `POST /rotate` | Stops the current tunnel and connects via the next server, falling through the rest of the list when a server refuses SSH, then returns status after readiness                                                                                                               |
+| `POST /reload` | Re-reads the YAML and applies every change that needs no rebind; returns `applied`, `unchanged`, `refused`, `error`, `deferred` and the resulting server count. **404** when the service was started without a config file                                                   |
+
+`requests` totals the HTTP requests the HTTP proxy carried over the current
+SSH connection (`current`) and over the connection before it (`last`), which is
+what the panel's `HTTP requests` row shows. A forwarded request and a CONNECT
+each count once; a request the tunnel never carried — a refused SOCKS
+connection or a request rejected before it — counts nowhere, and the encrypted
+requests inside a CONNECT tunnel cannot be counted at all. While no adopted
+connection is running, the SOCKS port belongs to no tunnel of this service, so
+requests reaching another listener there count nowhere either. The current
+total starts again whenever the tunnel connects to another server, and a tunnel
+that exits on its own reports its own total as the last value until the next
+connection replaces it.
 
 Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
 
@@ -241,7 +254,8 @@ Example connected status:
   "proxy": { "ip": "127.0.0.1", "port": 1080 },
   "http_proxy": { "enabled": true, "ip": "127.0.0.1", "port": 8118 },
   "last_error": null,
-  "version": "1.3.0",
+  "requests": { "current": 12, "last": 3 },
+  "version": "1.4.0",
   "config_reload": {
     "watching": true,
     "path": "/etc/tunnel-switch/config.yaml",

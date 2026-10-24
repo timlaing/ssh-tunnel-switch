@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-10-24
 
 - Let the status panel's rotate key (Ctrl+N) bypass the rotation cooldown: an interactive rotation is a deliberate request from the operator, so it is admitted whenever no other connection change is running. The API, Alt+R and Ctrl+E keep enforcing the cooldown as before.
 - Add a server picker to the status panel: Alt+S lists the configured servers with the current one marked and the highlight starting on it, ↑/↓ or j/k move the highlight, Enter connects to the highlighted server alone (no failover, no cooldown) and Esc cancels. The picker owns the keyboard while open, so other keys do nothing until it closes.
+- Add a request counter to the status panel: the `HTTP requests` row shows how many requests the HTTP proxy carried over the current SSH connection (`current`) and how many the connection before it carried (`last`). A forwarded request and a CONNECT each count once, a request the tunnel never carried counts nowhere, and the current total starts again whenever the tunnel connects to another server.
+- Report the same totals on `GET /status` as `requests.current` and `requests.last`. A tunnel that exits on its own reports its own total as the last value until the next connection replaces it.
 
 ## 1.3.0 — 2026-10-19
 

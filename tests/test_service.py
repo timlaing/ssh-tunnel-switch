@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import threading
 from unittest.mock import AsyncMock
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from typer.testing import CliRunner
 from tunnel_switch.api import create_app
 from tunnel_switch.cli import app, main
 from tunnel_switch.config import Config, load_config
+from tunnel_switch.counters import RequestCounter
 from tunnel_switch.tunnel import TunnelManager, TunnelFailure, RotationRejected
 
 
@@ -89,6 +91,76 @@ async def test_status_reports_one_connection_snapshot(manager):
         None,
         None,
     )
+    await manager.close()
+
+
+async def test_request_totals_follow_the_connection(manager):
+    await manager.rotate()
+    # The adopted connection opens its own total.
+    assert manager.status()["requests"] == {"current": 0, "last": 0}
+    for _ in range(3):
+        manager.counter.record()
+    assert manager.status()["requests"] == {"current": 3, "last": 0}
+    await manager.rotate()
+    # The next connection reports its own total beside the previous one.
+    assert manager.status()["requests"] == {"current": 0, "last": 3}
+    manager.counter.record()
+    assert manager.status()["requests"] == {"current": 1, "last": 3}
+    await manager.close()
+
+
+async def test_request_totals_of_a_tunnel_that_exited_report_as_last(manager):
+    await manager.rotate()
+    manager.counter.record()
+    manager.counter.record()
+    manager.process.returncode = 255
+    # ssh left on its own: its counts are the last connection's, not current.
+    assert manager.status()["requests"] == {"current": 0, "last": 2}
+    await manager.close()
+
+
+async def test_disconnect_keeps_the_finished_total_as_last(manager):
+    await manager.rotate()
+    manager.counter.record()
+    manager.counter.record()
+    assert (await manager.disconnect())["requests"] == {"current": 0, "last": 2}
+    # Reconnecting does not restart the previous connection's total.
+    restarted = await manager.restart()
+    assert restarted["requests"] == {"current": 0, "last": 2}
+    await manager.close()
+
+
+async def test_status_pairs_the_totals_with_the_connection_they_belong_to(manager):
+    await manager.rotate()
+    for _ in range(3):
+        manager.counter.record()
+    first = manager.status()
+    first_id = first["connection_id"]
+    assert first["requests"] == {"current": 3, "last": 0}
+    observed = []
+    stop = threading.Event()
+
+    def read_status():
+        while not stop.is_set():
+            observed.append(manager.status())
+
+    reader = threading.Thread(target=read_status, daemon=True)
+    reader.start()
+    try:
+        # Rotations publish new connections while status() reads, which is the
+        # moment a read could straddle the two: the ID of the old connection
+        # beside the totals the new one has already taken over.
+        for _ in range(25):
+            await manager.rotate()
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+    assert observed, "the reading thread never observed a status"
+    for seen in observed:
+        if seen["connection_id"] == first_id:
+            assert seen["requests"] == {"current": 3, "last": 0}
+        if seen["connection_id"] is None:
+            assert seen["requests"]["current"] == 0
     await manager.close()
 
 
@@ -838,6 +910,50 @@ def test_startup_echo_reports_the_version(capsys):
 
     _echo_startup(config(), "token", None)
     assert f"Version: {__version__}" in capsys.readouterr().out
+
+
+async def test_status_endpoint_reports_the_proxy_request_counter(manager):
+    await manager.rotate()
+    application = create_app(manager.config, "secret", manager)
+    # The proxy records into the very counter the endpoint reports, so a
+    # request carried over the tunnel shows up without any extra plumbing.
+    assert application.state.http_proxy.counter is manager.counter
+    application.state.http_proxy.counter.record()
+    headers = {"Authorization": "Bearer secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        payload = (await client.get("/status", headers=headers)).json()
+    assert payload["requests"] == {"current": 1, "last": 0}
+    await manager.close()
+
+
+async def test_proxy_records_only_while_the_adopted_tunnel_runs(manager):
+    await manager.rotate()
+    application = create_app(manager.config, "secret", manager)
+    # The gate is the manager's own check, so what answers on the SOCKS port
+    # is counted only while the tunnel this manager adopted serves it.
+    proxy = application.state.http_proxy
+    assert proxy.active() is True
+    manager.process.returncode = 255
+    assert proxy.active() is False
+    await manager.close()
+
+
+def test_create_app_refuses_a_manager_beside_a_separate_counter(manager):
+    # The proxy records into the manager's counter, so a second counter would
+    # silently collect nothing: say so instead of reporting wrong totals.
+    duplicate = RequestCounter()
+    with pytest.raises(ValueError, match="not both"):
+        create_app(manager.config, "secret", manager, counter=duplicate)
+
+
+def test_create_app_gives_a_supplied_counter_to_the_manager_it_builds():
+    counter = RequestCounter()
+    application = create_app(config(), "secret", counter=counter)
+    assert application.state.manager.counter is counter
+    assert application.state.http_proxy.counter is counter
+    assert application.state.http_proxy.active == application.state.manager.adopted
 
 
 async def test_status_reports_the_package_version(manager):
