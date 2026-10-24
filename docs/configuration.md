@@ -213,9 +213,11 @@ SSH connection (`current`) and over the connection before it (`last`), which is
 what the panel's `HTTP requests` row shows. A forwarded request and a CONNECT
 each count once; a request the tunnel never carried — a refused SOCKS
 connection or a request rejected before it — counts nowhere, and the encrypted
-requests inside a CONNECT tunnel cannot be counted at all. The current total
-starts again whenever the tunnel connects to another server, and a tunnel that
-exits on its own reports its own total as the last value until the next
+requests inside a CONNECT tunnel cannot be counted at all. While no adopted
+connection is running, the SOCKS port belongs to no tunnel of this service, so
+requests reaching another listener there count nowhere either. The current
+total starts again whenever the tunnel connects to another server, and a tunnel
+that exits on its own reports its own total as the last value until the next
 connection replaces it.
 
 Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.

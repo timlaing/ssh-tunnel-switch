@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from tunnel_switch.api import create_app
 from tunnel_switch.cli import app, main
 from tunnel_switch.config import Config, load_config
+from tunnel_switch.counters import RequestCounter
 from tunnel_switch.tunnel import TunnelManager, TunnelFailure, RotationRejected
 
 
@@ -925,6 +926,33 @@ async def test_status_endpoint_reports_the_proxy_request_counter(manager):
         payload = (await client.get("/status", headers=headers)).json()
     assert payload["requests"] == {"current": 1, "last": 0}
     await manager.close()
+
+
+async def test_proxy_records_only_while_the_adopted_tunnel_runs(manager):
+    await manager.rotate()
+    application = create_app(manager.config, "secret", manager)
+    # The gate is the manager's own check, so what answers on the SOCKS port
+    # is counted only while the tunnel this manager adopted serves it.
+    proxy = application.state.http_proxy
+    assert proxy.active() is True
+    manager.process.returncode = 255
+    assert proxy.active() is False
+    await manager.close()
+
+
+def test_create_app_refuses_a_manager_beside_a_separate_counter(manager):
+    # The proxy records into the manager's counter, so a second counter would
+    # silently collect nothing: say so instead of reporting wrong totals.
+    with pytest.raises(ValueError, match="not both"):
+        create_app(manager.config, "secret", manager, counter=RequestCounter())
+
+
+def test_create_app_gives_a_supplied_counter_to_the_manager_it_builds():
+    counter = RequestCounter()
+    application = create_app(config(), "secret", counter=counter)
+    assert application.state.manager.counter is counter
+    assert application.state.http_proxy.counter is counter
+    assert application.state.http_proxy.active == application.state.manager.adopted
 
 
 async def test_status_reports_the_package_version(manager):

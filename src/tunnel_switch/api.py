@@ -200,10 +200,19 @@ def create_app(
 ) -> FastAPI:
     if not token:
         raise ValueError("API token must not be empty")
+    if manager is not None and counter is not None:
+        raise ValueError(
+            "Pass either a manager or a counter, not both: the proxy records "
+            "into the counter of the manager it serves, so a separate "
+            "counter would never see the requests"
+        )
     manager = manager or TunnelManager(config, counter=counter)
     # The proxy records into the manager's counter, so one total backs both the
-    # status panel and GET /status no matter which of the two was built here.
-    proxy = HTTPProxyServer(config, counter=manager.counter)
+    # status panel and GET /status no matter which of the two was built here,
+    # and it asks the manager whether an adopted tunnel is running before it
+    # counts, so traffic on the SOCKS port while no tunnel is ours does not
+    # enter the totals.
+    proxy = HTTPProxyServer(config, counter=manager.counter, active=manager.adopted)
     app = FastAPI(
         title="Tunnel Switch", lifespan=_lifespan(config, manager, proxy, watch)
     )

@@ -47,7 +47,7 @@ async def network():
 
 
 @asynccontextmanager
-async def bridge(network, *, rejected=False, **settings):
+async def bridge(network, *, rejected=False, active=None, **settings):
     destinations = []
 
     async def socks(reader, writer):
@@ -94,7 +94,7 @@ async def bridge(network, *, rejected=False, **settings):
                                  "proxy": {"ip": "127.0.0.1", "port": socks_port},
                                  "http_proxy": settings, "start_on_launch": False})
     cfg.http_proxy.port = 0  # Ask the OS for an ephemeral listener only in tests.
-    proxy = HTTPProxyServer(cfg)
+    proxy = HTTPProxyServer(cfg, active=active)
     await proxy.start()
     port = proxy.server.sockets[0].getsockname()[1]
     try:
@@ -376,3 +376,37 @@ async def test_requests_the_tunnel_never_carried_are_not_counted(network):
         await writer.wait_closed()
         # Neither a refused tunnel nor a request rejected before it counts.
         assert proxy.counter.current == 0
+
+
+async def test_requests_are_only_counted_while_an_adopted_tunnel_serves(network):
+    async def origin(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+        except asyncio.IncompleteReadError:
+            return
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+
+    origin_port = await network(origin)
+    request = f"GET http://example.test:{origin_port}/ HTTP/1.1\r\nHost: example.test\r\n\r\n".encode()
+
+    # No adopted tunnel serves the SOCKS port: the listener answering is not
+    # this tunnel's, so the request it carries is not ours to count.
+    async with bridge(network, active=lambda: False) as (port, _, proxy):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(request)
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.readuntil(b"ok"), 2)).endswith(b"ok")
+        writer.close()
+        await writer.wait_closed()
+        assert proxy.counter.current == 0
+
+    # The adopted tunnel is running again: the same request counts once.
+    async with bridge(network, active=lambda: True) as (port, _, proxy):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(request)
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.readuntil(b"ok"), 2)).endswith(b"ok")
+        writer.close()
+        await writer.wait_closed()
+        assert proxy.counter.current == 1

@@ -1,5 +1,6 @@
 """HTTP/1.1 forward proxy and CONNECT bridge over the managed SSH SOCKS5 socket."""
 import asyncio
+from collections.abc import Callable
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 import h11
@@ -48,11 +49,20 @@ def headers_for_forwarding(headers, *, host: str | None = None):
 
 
 class HTTPProxyServer:
-    def __init__(self, config: Config, counter: RequestCounter | None = None):
+    def __init__(
+        self,
+        config: Config,
+        counter: RequestCounter | None = None,
+        active: Callable[[], bool] | None = None,
+    ):
         self.config = config
         # The tunnel manager's counter, so the requests recorded here are the
         # ones its status reports for the connection they were carried over.
         self.counter = counter or RequestCounter()
+        # The manager's adopted-connection check: while it is false nothing on
+        # the SOCKS port belongs to this tunnel, so a listener that is not ours
+        # carries traffic this counter must not claim.
+        self.active = active
         self.server = None
         self._tasks = set()
         self._closing = False
@@ -238,8 +248,11 @@ class HTTPProxyServer:
                 self._socks(host, port), self.config.http_proxy.connect_timeout_seconds)
             # Counted once the tunnel accepts it: a forward and a CONNECT are
             # each one request over the connection, and the encrypted requests
-            # inside a CONNECT tunnel cannot be seen from here.
-            self.counter.record()
+            # inside a CONNECT tunnel cannot be seen from here. The gate keeps
+            # the totals this tunnel's: while no adopted connection serves the
+            # SOCKS port, the listener answering is not ours to count.
+            if self.active is None or self.active():
+                self.counter.record()
             if connect:
                 writer.write(inbound.send(h11.Response(status_code=200, headers=[], reason=b"Connection Established")))
                 await writer.drain()
