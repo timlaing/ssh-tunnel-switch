@@ -105,6 +105,62 @@ def _server_picker(config: Config, status: dict, state: PanelState) -> Group:
     return Group(*lines)
 
 
+def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
+    """The fixed rows: tunnel identity, listeners and the log file."""
+    state_name = status["state"]
+    connection = (status["connection_id"] or "")[:8]
+    started = status["started_at"] or "-"
+    if status["started_at"]:
+        started += f" (up {_elapsed(status['started_at'])})"
+    rows = [
+        ("State", f"[{STATE_STYLES.get(state_name, 'white')}]{state_name}[/]"),
+        ("Server", status["server"] or "-"),
+        ("Connection", f"{connection} ({status['server']})" if connection else "-"),
+        ("Started", started),
+        ("SOCKS proxy", _endpoint(status["proxy"]["ip"], status["proxy"]["port"])),
+    ]
+    if config.http_proxy.enabled:
+        rows.append(
+            ("HTTP proxy", _endpoint(config.http_proxy.ip, config.http_proxy.port))
+        )
+    rows.extend(
+        [
+            ("API", _endpoint(config.api.ip, config.api.port)),
+            (
+                "Log file",
+                str(config.logging.file) if config.logging.file else "disabled",
+            ),
+        ]
+    )
+    return rows
+
+
+def _feedback_rows(status: dict, state: PanelState | None) -> list[tuple[str, str]]:
+    """The rows that only appear once something has happened."""
+    rows = []
+    if state is not None and state.last_reload:
+        rows.append(("Last reload", state.last_reload))
+    if state is not None and state.last_action:
+        rows.append(("Last action", state.last_action))
+    if status["last_error"]:
+        rows.append(("Last error", f"[red]{status['last_error']}[/]"))
+    return rows
+
+
+def _footer(config: Config, status: dict, state: PanelState | None, keys: bool) -> list:
+    """The picker when it is open, the key footer otherwise, nothing without keys."""
+    if not keys:
+        return []
+    if state is not None and state.picker_index is not None:
+        # The picker takes over the footer: the normal keys mean nothing until
+        # the open choice is confirmed or cancelled.
+        return [
+            _server_picker(config, status, state),
+            *(Text(line, style="dim") for line in PICKER_FOOTER),
+        ]
+    return [Text(line, style="dim") for line in FOOTER]
+
+
 def status_panel(
     config: Config,
     status: dict,
@@ -115,49 +171,12 @@ def status_panel(
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold cyan", justify="left")
     table.add_column(justify="left")
-    state_name = status["state"]
-    table.add_row("State", f"[{STATE_STYLES.get(state_name, 'white')}]{state_name}[/]")
-    server = status["server"] or "-"
-    table.add_row("Server", server)
-    connection = (status["connection_id"] or "")[:8]
-    table.add_row(
-        "Connection", f"{connection} ({status['server']})" if connection else "-"
-    )
-    started = status["started_at"] or "-"
-    if status["started_at"]:
-        started += f" (up {_elapsed(status['started_at'])})"
-    table.add_row("Started", started)
-    proxy = status["proxy"]
-    table.add_row("SOCKS proxy", _endpoint(proxy["ip"], proxy["port"]))
-    if config.http_proxy.enabled:
-        table.add_row(
-            "HTTP proxy",
-            _endpoint(config.http_proxy.ip, config.http_proxy.port),
-        )
-    table.add_row("API", _endpoint(config.api.ip, config.api.port))
-    table.add_row(
-        "Log file", str(config.logging.file) if config.logging.file else "disabled"
-    )
-    if state is not None and state.last_reload:
-        table.add_row("Last reload", state.last_reload)
-    if state is not None and state.last_action:
-        table.add_row("Last action", state.last_action)
-    if status["last_error"]:
-        table.add_row("Last error", f"[red]{status['last_error']}[/]")
-    body = [table]
-    picking = state is not None and state.picker_index is not None
-    if keys and picking:
-        # The picker takes over the footer: the normal keys mean nothing until
-        # the open choice is confirmed or cancelled.
-        body.append(_server_picker(config, status, state))
-        footer = PICKER_FOOTER
-    elif keys:
-        footer = FOOTER
-    else:
-        footer = ()
-    body.extend(Text(line, style="dim") for line in footer)
+    for label, value in _summary_rows(config, status):
+        table.add_row(label, value)
+    for label, value in _feedback_rows(status, state):
+        table.add_row(label, value)
     return Panel(
-        Group(*body),
+        Group(table, *_footer(config, status, state, keys)),
         title=f"SSH Tunnel Switch {__version__}",
         border_style="blue",
     )
