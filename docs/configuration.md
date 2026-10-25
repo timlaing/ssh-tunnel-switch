@@ -263,7 +263,7 @@ Example connected status:
   "http_proxy": { "enabled": true, "ip": "127.0.0.1", "port": 8118 },
   "last_error": null,
   "requests": { "current": 12, "last": 3 },
-  "version": "1.4.0",
+  "version": "1.4.1",
   "config_reload": {
     "watching": true,
     "path": "/etc/tunnel-switch/config.yaml",

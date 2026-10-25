@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ssh-tunnel-switch"
-version = "1.4.0"
+version = "1.4.1"
 description = "SSH SOCKS5 tunnel rotation service with an HTTP proxy and REST API"
 readme = "README.md"
 license = "MIT"

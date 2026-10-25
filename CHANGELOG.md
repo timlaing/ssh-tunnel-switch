@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.1 — 2026-10-25
 
 - Add Ctrl+S as a second way to open the status panel's server picker, for terminals where the Option key types a character instead of sending an Escape sequence — macOS Terminal.app and iTerm2 send `ß` for Option+S until "Use Option as Meta key" is enabled, and Alt+S can never work there. Software flow control is now switched off while the panel is up, so Ctrl+S reaches the key map instead of pausing the output; the saved terminal settings restore it on exit. A terminal that refuses the change, or a build of `termios` without those flags, is reported in the log and keeps every other key working.
 
