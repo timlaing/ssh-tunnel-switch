@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add Ctrl+S as a second way to open the status panel's server picker, for terminals where the Option key types a character instead of sending an Escape sequence — macOS Terminal.app and iTerm2 send `ß` for Option+S until "Use Option as Meta key" is enabled, and Alt+S can never work there. Software flow control is now switched off while the panel is up, so Ctrl+S reaches the key map instead of pausing the output; the saved terminal settings restore it on exit, and a terminal that refuses the change keeps every other key.
+
 ## 1.4.0 — 2026-10-24
 
 - Let the status panel's rotate key (Ctrl+N) bypass the rotation cooldown: an interactive rotation is a deliberate request from the operator, so it is admitted whenever no other connection change is running. The API, Alt+R and Ctrl+E keep enforcing the cooldown as before.
