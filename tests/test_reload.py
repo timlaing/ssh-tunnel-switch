@@ -421,6 +421,7 @@ async def test_reload_rotates_the_bearer_token(yaml_file):
         (b"\x05", "connect"),  # Ctrl+E
         (b"\x04", "disconnect"),  # Ctrl+D
         (b"\x1bs", "select"),  # Alt+S
+        (b"\x13", "select"),  # Ctrl+S, for a terminal whose Option key types
         (b"x\x12", "reload"),  # A key read may carry extra bytes.
     ],
 )
@@ -448,7 +449,7 @@ def test_status_panel_shows_feedback_and_the_key_footer():
     assert "rotate: two" in with_keys
     assert "Ctrl+R: reload config" in with_keys
     assert "Ctrl+N: rotate server" in with_keys
-    assert "Alt+S: select server" in with_keys
+    assert "Alt+S/Ctrl+S: select server" in with_keys
     without_keys = rendered(cfg, state=state)
     assert "Ctrl+R" not in without_keys
     # Without feedback the rows are omitted entirely.
@@ -977,21 +978,92 @@ def test_key_reader_cbreaks_a_terminal_and_restores_it(monkeypatch):
 
     from tunnel_switch.status import _key_reader
 
-    saved = ["original"]
+    # The shape tcgetattr() really returns: index 0 holds the input flags.
+    saved = [
+        termios.ICRNL | termios.IXON | termios.IXANY | termios.IXOFF,
+        0,
+        0,
+        termios.ICANON | termios.ECHO,
+        0,
+        0,
+        [0] * 32,
+    ]
     applied = []
     monkeypatch.setattr(
         sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
     )
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: saved)
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: list(saved))
     monkeypatch.setattr(tty, "setcbreak", lambda fd: applied.append(("cbreak", fd)))
     monkeypatch.setattr(
-        termios, "tcsetattr", lambda fd, when, buf: applied.append(("restore", buf))
+        termios,
+        "tcsetattr",
+        lambda fd, when, buf: applied.append(("tcsetattr", when, list(buf))),
     )
     descriptor, restore = _key_reader()
     assert descriptor == 7
-    assert applied == [("cbreak", 7)]
+    # cbreak first, then flow control off so Ctrl+S reaches the key map.
+    assert [entry[0] for entry in applied] == ["cbreak", "tcsetattr"]
+    when, mode = applied[1][1], applied[1][2]
+    assert when == termios.TCSANOW
+    assert mode[0] == termios.ICRNL  # IXON/IXANY/IXOFF are gone, ICRNL stays
+    assert mode[3] == saved[3]  # cbreak's own change is setcbreak's business
     restore()
-    assert applied == [("cbreak", 7), ("restore", saved)]
+    assert applied[-1] == ("tcsetattr", termios.TCSADRAIN, saved)
+
+
+def test_key_reader_keeps_the_keys_when_flow_control_cannot_be_dropped(
+    monkeypatch, caplog
+):
+    import logging
+    import sys
+    import termios
+    import tty
+
+    from tunnel_switch.status import _key_reader
+
+    mode = [termios.IXON, 0, 0, 0, 0, 0, [0] * 32]
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: list(mode))
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(
+        termios, "tcsetattr", lambda fd, when, buf: (_ for _ in ()).throw(OSError())
+    )
+    with caplog.at_level(logging.WARNING, logger="tunnel_switch.status"):
+        descriptor, restore = _key_reader()
+    # A terminal that refuses the change keeps Ctrl+S as XOFF, but every other
+    # key still works, so the panel does not lose its keyboard over it.
+    assert descriptor == 7
+    # The refusal is reported: a Ctrl+S that only pauses the output would
+    # otherwise look exactly like a key the panel never received.
+    assert "Ctrl+S" in caplog.text
+    restore()
+
+
+def test_key_reader_reads_only_the_flow_control_flags_it_is_given(monkeypatch, caplog):
+    import logging
+    import sys
+    import termios
+    import tty
+
+    from tunnel_switch.status import _key_reader
+
+    # A build of termios without these flags must not raise: this runs after
+    # cbreak is on and would otherwise strand the terminal with no restore.
+    for flag in ("IXON", "IXANY", "IXOFF"):
+        monkeypatch.delattr(termios, flag)
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: [0, 0, 0, 0, 0, 0, [0] * 32])
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, buf: None)
+    with caplog.at_level(logging.WARNING, logger="tunnel_switch.status"):
+        descriptor, restore = _key_reader()
+    assert descriptor == 7
+    assert "Ctrl+S" in caplog.text
+    restore()
 
 
 def test_key_reader_gives_up_when_the_terminal_refuses(monkeypatch):
@@ -1021,7 +1093,8 @@ def test_key_reader_survives_a_failing_restore(monkeypatch):
     monkeypatch.setattr(
         sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
     )
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["original"])
+    # The shape tcgetattr() really returns, so the flow-control step runs too.
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: [0, 0, 0, 0, 0, 0, [0] * 32])
     monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
     monkeypatch.setattr(
         termios, "tcsetattr", lambda fd, when, buf: (_ for _ in ()).throw(OSError())
@@ -1083,6 +1156,21 @@ def test_handle_keys_opens_moves_and_confirms_the_picker(monkeypatch, manager):
     status._handle_keys(0, actions, state, manager)
     assert state.picker_index is None
     assert picked == ["two"]
+
+
+def test_handle_keys_opens_the_picker_from_ctrl_s(monkeypatch, manager):
+    from tunnel_switch import status
+
+    picked = []
+    actions = {"select": lambda name: picked.append(name)}
+    state = PanelState()
+    reads = iter([b"\x13", b"\r"])  # Ctrl+S opens it, Enter takes the highlight
+    monkeypatch.setattr(status.os, "read", lambda fd, n: next(reads))
+    status._handle_keys(0, actions, state, manager)
+    assert state.picker_index == 0
+    status._handle_keys(0, actions, state, manager)
+    assert state.picker_index is None
+    assert picked == ["one"]
 
 
 async def test_handle_keys_opens_the_picker_on_the_connected_server(

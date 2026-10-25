@@ -6,6 +6,11 @@ rotate, select server). Keys run as coroutines on the service event loop; the
 terminal is put in cbreak mode so single keys arrive without echoing while
 ``ISIG`` stays enabled, keeping Ctrl-C a normal SIGINT for uvicorn's shutdown.
 
+The picker has two openers: Alt+S, for a terminal whose Option key sends
+Escape, and Ctrl+S, which needs no modifier setting at all. cbreak alone would
+swallow Ctrl+S as XOFF, so software flow control is switched off for as long as
+the panel is up.
+
 The select key opens an inline picker instead of dispatching at once: the
 panel lists every configured server, arrow keys (or ``j``/``k``) move the
 highlight, Enter hands the highlighted server to the select action and Esc
@@ -13,6 +18,7 @@ closes the picker without changing anything.
 """
 
 from datetime import datetime, timezone
+import logging
 import os
 import select
 from threading import Event
@@ -26,6 +32,8 @@ from rich.text import Text
 from . import __version__
 from .config import Config
 
+logger = logging.getLogger(__name__)
+
 REFRESH_SECONDS = 0.5
 ESCAPE_WAIT_SECONDS = 0.05
 STATE_STYLES = {"connected": "green", "rotating": "yellow", "disconnected": "red"}
@@ -35,9 +43,10 @@ KEYS = {
     b"\x04": "disconnect",
     b"\x0e": "rotate",
     b"\x1bs": "select",
+    b"\x13": "select",
 }
 FOOTER = (
-    "Ctrl+R: reload config · Alt+R: restart tunnel · Alt+S: select server",
+    "Ctrl+R: reload config · Alt+R: restart tunnel · Alt+S/Ctrl+S: select server",
     "Ctrl+N: rotate server · Ctrl+E: connect · Ctrl+D: disconnect · Ctrl+C: quit",
 )
 PICKER_FOOTER = (
@@ -194,13 +203,53 @@ def status_panel(
     )
 
 
+def _disable_flow_control(descriptor: int) -> None:
+    """Drop software flow control so Ctrl+S can be a key.
+
+    ``tty.setcbreak`` clears only ``ECHO`` and ``ICANON``: with ``IXON`` still
+    set the line discipline eats Ctrl+S as XOFF and the panel freezes instead
+    of opening the picker. The attributes ``_key_reader`` saved beforehand put
+    flow control back on exit, so this lasts only while the panel is shown.
+
+    The mask is built from the flags this build of ``termios`` actually
+    defines, and nothing here raises: the call runs after cbreak is already on
+    and before ``_key_reader`` returns, so an escaping exception would strand
+    the terminal with no echo and cost the panel its keyboard. A terminal that
+    refuses the change keeps the old behaviour, with the reason reported — a
+    Ctrl+S that only pauses the output is otherwise indistinguishable from one
+    the panel never received.
+    """
+    import termios
+
+    mask = 0
+    for flag in ("IXON", "IXANY", "IXOFF"):
+        mask |= getattr(termios, flag, 0)
+    if not mask:
+        logger.warning(
+            "This build of termios has no software flow-control flags; Ctrl+S "
+            "pauses the output instead of opening the server picker."
+        )
+        return
+    try:
+        mode = termios.tcgetattr(descriptor)
+        mode[0] &= ~mask
+        termios.tcsetattr(descriptor, termios.TCSANOW, mode)
+    except (OSError, termios.error) as exc:
+        logger.warning(
+            "Could not disable software flow control (%s); Ctrl+S pauses the "
+            "output instead of opening the server picker.",
+            exc,
+        )
+
+
 def _key_reader():
     """Put stdin in cbreak mode, returning its descriptor and a restore call.
 
     cbreak disables echo and line buffering so single keys are readable, while
     ``ISIG`` is left enabled: Ctrl-C still raises SIGINT and uvicorn still
-    performs its graceful shutdown. Non-terminal and non-POSIX runs simply get
-    no key handling.
+    performs its graceful shutdown. Software flow control is dropped
+    separately, so Ctrl+S reaches the key map instead of pausing the output.
+    Non-terminal and non-POSIX runs simply get no key handling.
     """
     if os.name != "posix":
         return None, lambda: None
@@ -217,6 +266,8 @@ def _key_reader():
         tty.setcbreak(descriptor)
     except (OSError, termios.error):
         return None, lambda: None
+
+    _disable_flow_control(descriptor)
 
     def restore():
         try:
