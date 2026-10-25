@@ -1011,7 +1011,10 @@ def test_key_reader_cbreaks_a_terminal_and_restores_it(monkeypatch):
     assert applied[-1] == ("tcsetattr", termios.TCSADRAIN, saved)
 
 
-def test_key_reader_keeps_the_keys_when_flow_control_cannot_be_dropped(monkeypatch):
+def test_key_reader_keeps_the_keys_when_flow_control_cannot_be_dropped(
+    monkeypatch, caplog
+):
+    import logging
     import sys
     import termios
     import tty
@@ -1027,10 +1030,39 @@ def test_key_reader_keeps_the_keys_when_flow_control_cannot_be_dropped(monkeypat
     monkeypatch.setattr(
         termios, "tcsetattr", lambda fd, when, buf: (_ for _ in ()).throw(OSError())
     )
-    descriptor, restore = _key_reader()
+    with caplog.at_level(logging.WARNING, logger="tunnel_switch.status"):
+        descriptor, restore = _key_reader()
     # A terminal that refuses the change keeps Ctrl+S as XOFF, but every other
     # key still works, so the panel does not lose its keyboard over it.
     assert descriptor == 7
+    # The refusal is reported: a Ctrl+S that only pauses the output would
+    # otherwise look exactly like a key the panel never received.
+    assert "Ctrl+S" in caplog.text
+    restore()
+
+
+def test_key_reader_reads_only_the_flow_control_flags_it_is_given(monkeypatch, caplog):
+    import logging
+    import sys
+    import termios
+    import tty
+
+    from tunnel_switch.status import _key_reader
+
+    # A build of termios without these flags must not raise: this runs after
+    # cbreak is on and would otherwise strand the terminal with no restore.
+    for flag in ("IXON", "IXANY", "IXOFF"):
+        monkeypatch.delattr(termios, flag)
+    monkeypatch.setattr(
+        sys, "stdin", SimpleNamespace(isatty=lambda: True, fileno=lambda: 7)
+    )
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: [0, 0, 0, 0, 0, 0, [0] * 32])
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, buf: None)
+    with caplog.at_level(logging.WARNING, logger="tunnel_switch.status"):
+        descriptor, restore = _key_reader()
+    assert descriptor == 7
+    assert "Ctrl+S" in caplog.text
     restore()
 
 

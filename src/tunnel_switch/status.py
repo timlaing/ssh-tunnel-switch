@@ -18,6 +18,7 @@ closes the picker without changing anything.
 """
 
 from datetime import datetime, timezone
+import logging
 import os
 import select
 from threading import Event
@@ -30,6 +31,8 @@ from rich.text import Text
 
 from . import __version__
 from .config import Config
+
+logger = logging.getLogger(__name__)
 
 REFRESH_SECONDS = 0.5
 ESCAPE_WAIT_SECONDS = 0.05
@@ -206,17 +209,37 @@ def _disable_flow_control(descriptor: int) -> None:
     ``tty.setcbreak`` clears only ``ECHO`` and ``ICANON``: with ``IXON`` still
     set the line discipline eats Ctrl+S as XOFF and the panel freezes instead
     of opening the picker. The attributes ``_key_reader`` saved beforehand put
-    flow control back on exit, so this lasts only while the panel is shown. A
-    terminal that refuses the change keeps the old behaviour.
+    flow control back on exit, so this lasts only while the panel is shown.
+
+    The mask is built from the flags this build of ``termios`` actually
+    defines, and nothing here raises: the call runs after cbreak is already on
+    and before ``_key_reader`` returns, so an escaping exception would strand
+    the terminal with no echo and cost the panel its keyboard. A terminal that
+    refuses the change keeps the old behaviour, with the reason reported — a
+    Ctrl+S that only pauses the output is otherwise indistinguishable from one
+    the panel never received.
     """
     import termios
 
+    mask = 0
+    for flag in ("IXON", "IXANY", "IXOFF"):
+        mask |= getattr(termios, flag, 0)
+    if not mask:
+        logger.warning(
+            "This build of termios has no software flow-control flags; Ctrl+S "
+            "pauses the output instead of opening the server picker."
+        )
+        return
     try:
         mode = termios.tcgetattr(descriptor)
-        mode[0] &= ~(termios.IXON | termios.IXANY | termios.IXOFF)
+        mode[0] &= ~mask
         termios.tcsetattr(descriptor, termios.TCSANOW, mode)
-    except (OSError, termios.error):
-        pass
+    except (OSError, termios.error) as exc:
+        logger.warning(
+            "Could not disable software flow control (%s); Ctrl+S pauses the "
+            "output instead of opening the server picker.",
+            exc,
+        )
 
 
 def _key_reader():
