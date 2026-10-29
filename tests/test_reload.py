@@ -488,7 +488,8 @@ def test_status_panel_picker_scrolls_inside_the_display():
     state.picker_index = 0
     top = rendered(cfg, state=state, keys=True, height=12)
     shown = re.findall(r"\bs\d\d\b", top)
-    assert shown and shown[0] == "s00"  # The window opens on the highlight.
+    assert shown  # The top window is never empty...
+    assert shown[0] == "s00"  # ...and it opens on the highlighted server.
     assert shown == [f"s{index:02}" for index in range(len(shown))]
     assert len(shown) < 24  # Too many servers to list: the window scrolls.
     # With 24 servers and an eight-row window, exactly 16 hide below.
