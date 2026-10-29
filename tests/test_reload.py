@@ -488,9 +488,11 @@ def test_status_panel_picker_scrolls_inside_the_display():
     state.picker_index = 0
     top = rendered(cfg, state=state, keys=True, height=12)
     shown = re.findall(r"\bs\d\d\b", top)
+    assert shown and shown[0] == "s00"  # The window opens on the highlight.
     assert shown == [f"s{index:02}" for index in range(len(shown))]
     assert len(shown) < 24  # Too many servers to list: the window scrolls.
-    assert re.search(r"\(\d+ more below\)", top)  # Hidden servers are counted.
+    # With 24 servers and an eight-row window, exactly 16 hide below.
+    assert "(16 more below)" in top
     assert "more above" not in top
     assert len(top.splitlines()) <= 12  # Nothing lands below the display.
     state.picker_index = 23
@@ -498,7 +500,7 @@ def test_status_panel_picker_scrolls_inside_the_display():
     shown = re.findall(r"\bs\d\d\b", bottom)
     assert "s23" in shown  # The window followed the highlight down...
     assert len(shown) < 24  # ...by scrolling, not by listing every server.
-    assert re.search(r"\(\d+ more above\)", bottom)
+    assert "(16 more above)" in bottom  # ...and the other 16 hide above.
     assert len(bottom.splitlines()) <= 12
 
 
@@ -517,7 +519,8 @@ def test_status_panel_picker_follows_the_highlight_a_row_at_a_time():
     cfg = many_servers(24)
     state = PanelState()
     state.picker_index = 23
-    rendered(cfg, state=state, keys=True, height=12)  # Scrolls it into view.
+    first = rendered(cfg, state=state, keys=True, height=12)  # Scrolls it in.
+    assert "s23" in first  # The first render already holds the highlight.
     assert state.picker_offset > 0
     lowest = state.picker_offset
     for index in range(22, -1, -1):
@@ -525,7 +528,8 @@ def test_status_panel_picker_follows_the_highlight_a_row_at_a_time():
         picking = rendered(cfg, state=state, keys=True, height=12)
         shown = re.findall(r"\bs\d\d\b", picking)
         assert f"s{index:02}" in shown  # The highlight is never scrolled away.
-        assert lowest - state.picker_offset <= 1  # It scrolls a row at a time.
+        # It scrolls a row at a time in either direction, never backwards.
+        assert 0 <= lowest - state.picker_offset <= 1
         lowest = state.picker_offset
     assert state.picker_offset == 0  # Back at the top, the window is too.
 
@@ -537,6 +541,41 @@ def test_status_panel_picker_keeps_one_row_in_a_tiny_display():
     picking = rendered(cfg, state=state, keys=True, height=4)
     assert "s00" in picking  # A display too short for the rows still lists one.
     assert "s01" not in picking
+    # The budget's one-row floor may overrun, but the cut keeps it inside.
+    assert len(picking.splitlines()) <= 4
+
+
+def test_status_panel_picker_clamps_a_highlight_a_reload_shrunk():
+    # A reload can leave the highlight past the end of the new, shorter list;
+    # the window must land inside that list, not render servers that are gone.
+    state = PanelState()
+    state.picker_index = 23
+    state.picker_offset = 16
+    picking = rendered(many_servers(5), state=state, keys=True, height=8)
+    shown = re.findall(r"\bs\d\d\b", picking)
+    assert shown == [f"s{index:02}" for index in range(1, 5)]
+    assert len(picking.splitlines()) <= 8
+
+
+def test_status_panel_picker_is_cut_at_the_display_when_lines_wrap():
+    # Rich folds a long server entry into two physical rows, which the
+    # logical row budget cannot see: the fold must be cut at the last line
+    # rather than push the pop-up below the display.
+    cfg = config(
+        servers=[
+            {
+                "name": f"s{index:02}",
+                "host": f"long-host-{index:02}.example.internal",
+                "user": "tunnel",
+            }
+            for index in range(12)
+        ]
+    )
+    state = PanelState()
+    state.picker_index = 0
+    picking = rendered(cfg, state=state, keys=True, height=10, width=40)
+    assert "s00" in picking
+    assert len(picking.splitlines()) <= 10
 
 
 def test_status_panel_picker_lists_every_server_without_a_display_height():
@@ -555,7 +594,7 @@ def test_status_panel_title_carries_the_version():
     assert f"SSH Tunnel Switch {__version__}" in rendered(config())
 
 
-def rendered(cfg, state=None, keys=False, server=None, height=None):
+def rendered(cfg, state=None, keys=False, server=None, height=None, width=100):
     from io import StringIO
     from rich.console import Console
 
@@ -568,7 +607,7 @@ def rendered(cfg, state=None, keys=False, server=None, height=None):
         "last_error": None,
     }
     buffer = StringIO()
-    Console(file=buffer, width=100, height=height).print(
+    Console(file=buffer, width=width, height=height).print(
         status_panel(cfg, status, state=state, keys=keys, height=height)
     )
     return buffer.getvalue()

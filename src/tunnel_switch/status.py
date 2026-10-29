@@ -113,15 +113,22 @@ class _Overlay:
     Rich has no absolute positioning, so both renderables are rendered against
     the same console and the pop-up's lines replace the panel's rows beneath
     them, starting ``offset`` rows down. Rows the pop-up does not reach keep
-    their panel content: the dashboard stays readable around it, and because
-    the pop-up is sized to the display, the pair never grows past its last
-    line.
+    their panel content: the dashboard stays readable around it.
+
+    ``limit`` is the largest number of rows the finished composition may use.
+    The row budget counts logical lines, but Rich folds a long server entry
+    into two physical rows, the floor in ``_picker_rows`` keeps one server
+    even when the display is too short for it, and a small display may hold
+    fewer rows than the dashboard alone: without this cut the result could
+    run past the display's last line and make ``Live`` scroll. What does not
+    fit is dropped rather than pushed below the display.
     """
 
-    def __init__(self, base, popup, offset: int = 0):
+    def __init__(self, base, popup, offset: int = 0, limit: int | None = None):
         self.base = base
         self.popup = popup
         self.offset = offset
+        self.limit = limit
 
     def __rich_console__(self, console, options):
         lines = list(Segment.split_lines(console.render(self.base, options)))
@@ -133,6 +140,8 @@ class _Overlay:
                 lines[row] = covered
             else:
                 lines.append(covered)
+        if self.limit is not None:
+            lines = lines[: self.limit]
         # split_lines drops the line breaks, so each one is put back: without
         # them the console sees one very long line and writes its first row.
         for line in lines:
@@ -161,19 +170,22 @@ def _picker_window(state: PanelState, total: int, rows: int | None) -> tuple[int
     The window keeps the highlight inside it and moves no further than it
     must: scrolling past the last visible server pushes the window down by
     one, scrolling back above the first pulls it up again. A shorter list (a
-    reload) or a shorter display pulls the window in with it.
+    reload) or a shorter display pulls the window in with it — the highlight
+    and the window are both clamped to the new bounds, so a reload that
+    shrinks the list below the highlighted index cannot send the window past
+    the end of the list and render servers that no longer exist.
     """
     if rows is None or rows >= total:
         state.picker_offset = 0
         return 0, total
+    index = min(state.picker_index or 0, total - 1)
     offset = min(state.picker_offset, total - rows)
-    index = state.picker_index or 0
     if index >= offset + rows:
         offset = index - rows + 1
     elif index < offset:
         offset = index
-    state.picker_offset = offset
-    return offset, offset + rows
+    state.picker_offset = max(0, min(offset, total - rows))
+    return state.picker_offset, state.picker_offset + rows
 
 
 def _server_picker(
@@ -268,7 +280,7 @@ def _feedback_rows(status: dict, state: PanelState | None) -> list[tuple[str, st
     return rows
 
 
-def _footer(config: Config, status: dict, state: PanelState | None, keys: bool) -> list:
+def _footer(state: PanelState | None, keys: bool) -> list:
     """The key footer, hidden while the open picker owns the keyboard."""
     if not keys or (state is not None and state.picker_index is not None):
         return []
@@ -300,7 +312,7 @@ def status_panel(
     ):
         table.add_row(label, value)
     panel = Panel(
-        Group(table, *_footer(config, status, state, keys)),
+        Group(table, *_footer(state, keys)),
         title=f"SSH Tunnel Switch {__version__}",
         border_style="blue",
     )
@@ -309,8 +321,13 @@ def status_panel(
     rows = _picker_rows(
         height, PICKER_OFFSET_LINES + PICKER_EDGE_LINES + len(PICKER_FOOTER)
     )
+    # The composition may use every row of the display and no more, so
+    # wrapped or over-budget content is cut at the last line, not below it.
     return _Overlay(
-        panel, _server_picker(config, status, state, rows), PICKER_OFFSET_LINES
+        panel,
+        _server_picker(config, status, state, rows),
+        PICKER_OFFSET_LINES,
+        height,
     )
 
 
