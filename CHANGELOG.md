@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Draw the status panel's server picker as a pop-up over the dashboard instead of a list appended beneath it: it starts below the panel's title border, replaces the rows it covers while the rows it does not reach keep showing the tunnel state, and its window is sized to the display, so opening it never extends past the display's last line. When the configured servers no longer fit the pop-up, the list scrolls inside it — a window follows the highlight a row at a time and the title counts what it hides (`Select server (3 more above, 5 more below)`). A display too short to spare any rows still keeps the highlighted one, so Enter always has something to confirm, and the picker's key hints, shortened to a single line, travel inside the pop-up box.
+
 ## 1.4.1 — 2026-10-25
 
 - Add Ctrl+S as a second way to open the status panel's server picker, for terminals where the Option key types a character instead of sending an Escape sequence — macOS Terminal.app and iTerm2 send `ß` for Option+S until "Use Option as Meta key" is enabled, and Alt+S can never work there. Software flow control is now switched off while the panel is up, so Ctrl+S reaches the key map instead of pausing the output; the saved terminal settings restore it on exit. A terminal that refuses the change, or a build of `termios` without those flags, is reported in the log and keeps every other key working.

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -34,6 +35,16 @@ def document(**changes):
 
 def config(**changes):
     return Config.model_validate(json.loads(document(**changes)))
+
+
+def many_servers(count):
+    """A validated config with more servers than a short display can list."""
+    return config(
+        servers=[
+            {"name": f"s{index:02}", "host": f"host{index}.example", "user": "tunnel"}
+            for index in range(count)
+        ]
+    )
 
 
 @pytest.fixture
@@ -471,13 +482,80 @@ def test_status_panel_renders_the_open_server_picker():
     assert "Select server" not in rendered(cfg, state=state)
 
 
+def test_status_panel_picker_scrolls_inside_the_display():
+    cfg = many_servers(24)
+    state = PanelState()
+    state.picker_index = 0
+    top = rendered(cfg, state=state, keys=True, height=12)
+    shown = re.findall(r"\bs\d\d\b", top)
+    assert shown == [f"s{index:02}" for index in range(len(shown))]
+    assert len(shown) < 24  # Too many servers to list: the window scrolls.
+    assert re.search(r"\(\d+ more below\)", top)  # Hidden servers are counted.
+    assert "more above" not in top
+    assert len(top.splitlines()) <= 12  # Nothing lands below the display.
+    state.picker_index = 23
+    bottom = rendered(cfg, state=state, keys=True, height=12)
+    shown = re.findall(r"\bs\d\d\b", bottom)
+    assert "s23" in shown  # The window followed the highlight down...
+    assert len(shown) < 24  # ...by scrolling, not by listing every server.
+    assert re.search(r"\(\d+ more above\)", bottom)
+    assert len(bottom.splitlines()) <= 12
+
+
+def test_status_panel_picker_pops_up_over_the_dashboard():
+    cfg = many_servers(24)
+    state = PanelState()
+    state.picker_index = 0
+    picking = rendered(cfg, state=state, keys=True, height=16)
+    assert "SSH Tunnel Switch" in picking  # The title stays above the pop-up.
+    # The dashboard's rows are covered by the picker, not pushed down by it.
+    assert "SOCKS proxy" not in picking
+    assert len(picking.splitlines()) == 16  # The pop-up ends on the last line.
+
+
+def test_status_panel_picker_follows_the_highlight_a_row_at_a_time():
+    cfg = many_servers(24)
+    state = PanelState()
+    state.picker_index = 23
+    rendered(cfg, state=state, keys=True, height=12)  # Scrolls it into view.
+    assert state.picker_offset > 0
+    lowest = state.picker_offset
+    for index in range(22, -1, -1):
+        state.picker_index = index
+        picking = rendered(cfg, state=state, keys=True, height=12)
+        shown = re.findall(r"\bs\d\d\b", picking)
+        assert f"s{index:02}" in shown  # The highlight is never scrolled away.
+        assert lowest - state.picker_offset <= 1  # It scrolls a row at a time.
+        lowest = state.picker_offset
+    assert state.picker_offset == 0  # Back at the top, the window is too.
+
+
+def test_status_panel_picker_keeps_one_row_in_a_tiny_display():
+    cfg = many_servers(12)
+    state = PanelState()
+    state.picker_index = 0
+    picking = rendered(cfg, state=state, keys=True, height=4)
+    assert "s00" in picking  # A display too short for the rows still lists one.
+    assert "s01" not in picking
+
+
+def test_status_panel_picker_lists_every_server_without_a_display_height():
+    # A caller with no display to fit (a plain render, a test) lists them all.
+    cfg = many_servers(12)
+    state = PanelState()
+    state.picker_index = 11
+    picking = rendered(cfg, state=state, keys=True)
+    assert "more above" not in picking
+    assert all(f"s{index:02}" in picking for index in range(12))
+
+
 def test_status_panel_title_carries_the_version():
     from tunnel_switch import __version__
 
     assert f"SSH Tunnel Switch {__version__}" in rendered(config())
 
 
-def rendered(cfg, state=None, keys=False, server=None):
+def rendered(cfg, state=None, keys=False, server=None, height=None):
     from io import StringIO
     from rich.console import Console
 
@@ -490,8 +568,8 @@ def rendered(cfg, state=None, keys=False, server=None):
         "last_error": None,
     }
     buffer = StringIO()
-    Console(file=buffer, width=100).print(
-        status_panel(cfg, status, state=state, keys=keys)
+    Console(file=buffer, width=100, height=height).print(
+        status_panel(cfg, status, state=state, keys=keys, height=height)
     )
     return buffer.getvalue()
 
