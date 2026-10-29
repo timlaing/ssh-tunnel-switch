@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.2 — 2026-10-29
 
 - Draw the status panel's server picker as a pop-up over the dashboard instead of a list appended beneath it: it starts below the panel's title border, replaces the rows it covers while the rows it does not reach keep showing the tunnel state, and its window is sized to the display, so opening it never extends past the display's last line. When the configured servers no longer fit the pop-up, the list scrolls inside it — a window follows the highlight a row at a time and the title counts what it hides (`Select server (3 more above, 5 more below)`). A display too short to spare any rows still keeps the highlighted one, so Enter always has something to confirm, and the picker's key hints, shortened to a single line, travel inside the pop-up box.
 
