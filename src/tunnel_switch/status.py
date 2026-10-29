@@ -11,10 +11,12 @@ Escape, and Ctrl+S, which needs no modifier setting at all. cbreak alone would
 swallow Ctrl+S as XOFF, so software flow control is switched off for as long as
 the panel is up.
 
-The select key opens an inline picker instead of dispatching at once: the
-panel lists every configured server, arrow keys (or ``j``/``k``) move the
-highlight, Enter hands the highlighted server to the select action and Esc
-closes the picker without changing anything.
+The select key opens an inline picker instead of dispatching at once: it
+pops up over the dashboard, starting below its title border, listing the
+configured servers in a window sized to the display, arrow keys (or
+``j``/``k``) move the highlight — scrolling the window with it — Enter hands
+the highlighted server to the select action and Esc closes the picker
+without changing anything.
 """
 
 from datetime import datetime, timezone
@@ -23,7 +25,7 @@ import os
 import select
 from threading import Event
 
-from rich.console import Console, Group
+from rich.console import Console, Group, Segment
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -49,12 +51,18 @@ FOOTER = (
     "Ctrl+R: reload config · Alt+R: restart tunnel · Alt+S/Ctrl+S: select server",
     "Ctrl+N: rotate server · Ctrl+E: connect · Ctrl+D: disconnect · Ctrl+C: quit",
 )
-PICKER_FOOTER = (
-    "↑/↓ or j/k: highlight · Enter: connect to the highlighted server · Esc: cancel",
-)
+# Short enough to stay a single line on a normal terminal: the picker's row
+# budget counts each of these strings as one line of the display.
+PICKER_FOOTER = ("↑/↓ or j/k: highlight · Enter: connect · Esc: cancel",)
 # Picker navigation, matched as one complete read: arrows and j/k move the
 # highlight, Enter and Esc resolve it. Every other byte is ignored.
 PICKER_KEYS = {b"\x1b[A": -1, b"k": -1, b"\x1b[B": 1, b"j": 1}
+# Lines the picker pop-up spends around its server list: its own top and
+# bottom border. It starts one row down, so the dashboard's title border
+# stays readable above it; together with the key hints these are the rows the
+# display budget subtracts to end the pop-up on its last line, never below.
+PICKER_EDGE_LINES = 2
+PICKER_OFFSET_LINES = 1
 
 
 def decode_key(sequence: bytes) -> str | None:
@@ -76,6 +84,9 @@ class PanelState:
         self.last_action = None
         # Highlighted row of the open server picker; None while it is closed.
         self.picker_index = None
+        # First server shown by the picker's scroll window, moved by rendering
+        # so the highlight stays visible within the display.
+        self.picker_offset = 0
 
 
 def _endpoint(ip, port: int) -> str:
@@ -96,11 +107,111 @@ def _elapsed(started_at: str | None) -> str:
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
-def _server_picker(config: Config, status: dict, state: PanelState) -> Group:
-    """List the configured servers, marking the highlighted and current one."""
+class _Overlay:
+    """One renderable drawn over another's rows, the way a pop-up covers a dashboard.
+
+    Rich has no absolute positioning, so both renderables are rendered against
+    the same console and the pop-up's lines replace the panel's rows beneath
+    them, starting ``offset`` rows down. Rows the pop-up does not reach keep
+    their panel content: the dashboard stays readable around it.
+
+    ``limit`` is the largest number of rows the finished composition may use.
+    The row budget counts logical lines, but Rich folds a long server entry
+    into two physical rows, the floor in ``_picker_rows`` keeps one server
+    even when the display is too short for it, and a small display may hold
+    fewer rows than the dashboard alone: without this cut the result could
+    run past the display's last line and make ``Live`` scroll. What does not
+    fit is dropped rather than pushed below the display.
+    """
+
+    def __init__(self, base, popup, offset: int = 0, limit: int | None = None):
+        self.base = base
+        self.popup = popup
+        self.offset = offset
+        self.limit = limit
+
+    def __rich_console__(self, console, options):
+        lines = list(Segment.split_lines(console.render(self.base, options)))
+        popup = list(Segment.split_lines(console.render(self.popup, options)))
+        for index, line in enumerate(popup):
+            row = self.offset + index
+            covered = Segment.adjust_line_length(line, options.max_width)
+            if row < len(lines):
+                lines[row] = covered
+            else:
+                lines.append(covered)
+        if self.limit is not None:
+            lines = lines[: self.limit]
+        # split_lines drops the line breaks, so each one is put back: without
+        # them the console sees one very long line and writes its first row.
+        for line in lines:
+            yield from line
+            yield Segment("\n")
+
+
+def _picker_rows(height: int | None, used: int) -> int | None:
+    """Server rows left over in a display ``height`` rows tall.
+
+    ``used`` counts every line the pop-up spends around the list: the offset
+    that keeps the dashboard's title visible, its borders and its key hints.
+    The list gets the rest of the dashboard rather than the window, so a long
+    server list scrolls inside the display instead of pushing past its last
+    line. A very short display still gets one row, so the picker keeps
+    working.
+    """
+    if height is None:
+        return None
+    return max(1, height - used)
+
+
+def _picker_window(state: PanelState, total: int, rows: int | None) -> tuple[int, int]:
+    """Choose the slice of ``total`` servers a window of ``rows`` rows shows.
+
+    The window keeps the highlight inside it and moves no further than it
+    must: scrolling past the last visible server pushes the window down by
+    one, scrolling back above the first pulls it up again. A shorter list (a
+    reload) or a shorter display pulls the window in with it — the highlight
+    and the window are both clamped to the new bounds, so a reload that
+    shrinks the list below the highlighted index cannot send the window past
+    the end of the list and render servers that no longer exist.
+    """
+    if rows is None or rows >= total:
+        state.picker_offset = 0
+        return 0, total
+    index = min(state.picker_index or 0, total - 1)
+    offset = min(state.picker_offset, total - rows)
+    if index >= offset + rows:
+        offset = index - rows + 1
+    elif index < offset:
+        offset = index
+    state.picker_offset = max(0, min(offset, total - rows))
+    return state.picker_offset, state.picker_offset + rows
+
+
+def _server_picker(
+    config: Config, status: dict, state: PanelState, rows: int | None = None
+) -> Panel:
+    """The picker as a pop-up: the servers in the window that fits the display.
+
+    The window follows the highlight, and the title names how many servers
+    are hidden above and below it, so a scrolled-away part of the list is
+    never silently missing. The key hints sit inside the same box, under the
+    list, so they stay with the picker wherever it lands.
+    """
     current = status["server"]
-    lines = [Text("Select server", style="bold")]
-    for index, server in enumerate(config.servers):
+    servers = config.servers
+    offset, end = _picker_window(state, len(servers), rows)
+    hidden = []
+    if offset:
+        hidden.append(f"{offset} more above")
+    if end < len(servers):
+        hidden.append(f"{len(servers) - end} more below")
+    title = "Select server"
+    if hidden:
+        title += f" ({', '.join(hidden)})"
+    lines = []
+    for index in range(offset, end):
+        server = servers[index]
         picked = index == state.picker_index
         host = "" if server.host == server.name else f" ({server.host})"
         marker = "❯ " if picked else "  "
@@ -111,7 +222,8 @@ def _server_picker(config: Config, status: dict, state: PanelState) -> Group:
                 style="bold" if picked else "dim",
             )
         )
-    return Group(*lines)
+    lines.extend(Text(line, style="dim") for line in PICKER_FOOTER)
+    return Panel(Group(*lines), title=title, border_style="cyan")
 
 
 def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
@@ -168,17 +280,10 @@ def _feedback_rows(status: dict, state: PanelState | None) -> list[tuple[str, st
     return rows
 
 
-def _footer(config: Config, status: dict, state: PanelState | None, keys: bool) -> list:
-    """The picker when it is open, the key footer otherwise, nothing without keys."""
-    if not keys:
+def _footer(state: PanelState | None, keys: bool) -> list:
+    """The key footer, hidden while the open picker owns the keyboard."""
+    if not keys or (state is not None and state.picker_index is not None):
         return []
-    if state is not None and state.picker_index is not None:
-        # The picker takes over the footer: the normal keys mean nothing until
-        # the open choice is confirmed or cancelled.
-        return [
-            _server_picker(config, status, state),
-            *(Text(line, style="dim") for line in PICKER_FOOTER),
-        ]
     return [Text(line, style="dim") for line in FOOTER]
 
 
@@ -187,19 +292,42 @@ def status_panel(
     status: dict,
     state: PanelState | None = None,
     keys: bool = False,
-) -> Panel:
-    """Render the current tunnel state as a single status panel."""
+    height: int | None = None,
+) -> Panel | _Overlay:
+    """Render the current tunnel state as a single status panel.
+
+    An open picker is drawn as a pop-up over the dashboard rather than a list
+    beneath it: the panel keeps its rows, the picker replaces the ones it
+    covers starting below the title border, and its window is sized to the
+    display so the pair ends on the display's last line. ``height`` is that
+    display's height in rows; a caller that passes none (a test, a plain
+    render) lists every server in the pop-up.
+    """
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold cyan", justify="left")
     table.add_column(justify="left")
-    for label, value in _summary_rows(config, status):
+    for label, value in (
+        *_summary_rows(config, status),
+        *_feedback_rows(status, state),
+    ):
         table.add_row(label, value)
-    for label, value in _feedback_rows(status, state):
-        table.add_row(label, value)
-    return Panel(
-        Group(table, *_footer(config, status, state, keys)),
+    panel = Panel(
+        Group(table, *_footer(state, keys)),
         title=f"SSH Tunnel Switch {__version__}",
         border_style="blue",
+    )
+    if not keys or state is None or state.picker_index is None:
+        return panel
+    rows = _picker_rows(
+        height, PICKER_OFFSET_LINES + PICKER_EDGE_LINES + len(PICKER_FOOTER)
+    )
+    # The composition may use every row of the display and no more, so
+    # wrapped or over-budget content is cut at the last line, not below it.
+    return _Overlay(
+        panel,
+        _server_picker(config, status, state, rows),
+        PICKER_OFFSET_LINES,
+        height,
     )
 
 
@@ -297,6 +425,13 @@ def _open_picker(state: PanelState, manager) -> None:
         ),
         0,
     )
+    state.picker_offset = 0
+
+
+def _close_picker(state: PanelState) -> None:
+    """Dismiss the picker, taking its scroll window back to the top."""
+    state.picker_index = None
+    state.picker_offset = 0
 
 
 def _handle_picker(sequence: bytes, actions, state: PanelState, manager) -> None:
@@ -310,11 +445,11 @@ def _handle_picker(sequence: bytes, actions, state: PanelState, manager) -> None
         # A reload may have shrunk the list while the picker was open, so the
         # highlight is validated before it names a server.
         chosen = servers[index] if 0 <= index < len(servers) else None
-        state.picker_index = None
+        _close_picker(state)
         if chosen is not None and actions is not None and "select" in actions:
             _dispatch(actions["select"], state, "select", chosen.name)
     elif sequence == b"\x1b":
-        state.picker_index = None
+        _close_picker(state)
 
 
 def _handle_keys(descriptor: int, actions, state: PanelState, manager=None) -> None:
@@ -357,9 +492,21 @@ def run_status_display(
     state = state or PanelState()
     descriptor, restore = _key_reader()
     keys = descriptor is not None and actions is not None
+
+    def panel():
+        # The display's height, not the window's, caps the open picker: the
+        # panel is what the terminal shows, so the list scrolls inside it.
+        return status_panel(
+            manager.config,
+            manager.status(),
+            state,
+            keys=keys,
+            height=console.height,
+        )
+
     try:
         with Live(
-            status_panel(manager.config, manager.status(), state, keys=keys),
+            panel(),
             console=console,
             refresh_per_second=2,
             transient=True,
@@ -373,9 +520,7 @@ def run_status_display(
                     readable = []
                     if stop.wait(REFRESH_SECONDS):
                         break
-                live.update(
-                    status_panel(manager.config, manager.status(), state, keys=keys)
-                )
+                live.update(panel())
                 if stop.is_set():
                     break
                 if readable:

@@ -130,10 +130,19 @@ exit:
 | Ctrl+R       | reload the configuration, as `POST /reload` does                                 |
 | Ctrl+C       | stop the service (unchanged: SIGINT, normal uvicorn shutdown)                    |
 
-The picker lists every configured server with the current one marked, starts
+The picker lists the configured servers with the current one marked, starts
 highlighted on the server the tunnel uses, and closes on Enter (connect to the
 highlighted server) or Esc (change nothing); ↑/↓ or j/k move the highlight. It
 takes over the keyboard while open, so no other key acts until it closes.
+
+The picker is a pop-up drawn over the dashboard, starting below its title
+border, so opening it never pushes the panel past the display's last line:
+the rows it covers are replaced, and the rows it does not reach keep showing
+the tunnel state. When the configured servers no longer fit the pop-up, the
+list scrolls inside it — a window of servers follows the highlight a row at a
+time, and the title counts what it hides, for example `Select server (3 more
+above, 5 more below)`. A display too short to spare any rows still keeps the
+highlighted one, so Enter always has something to confirm.
 
 Both openers do the same thing. Alt+S suits a terminal whose Option key sends
 Escape; Ctrl+S suits one where Option types a character instead — macOS
