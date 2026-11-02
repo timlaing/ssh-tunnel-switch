@@ -492,6 +492,70 @@ async def test_authenticated_api_and_busy_response(manager):
     await manager.close()
 
 
+async def test_rotate_with_reason_logs_and_returns_200(manager, caplog):
+    """POST /rotate with a reason body should be accepted and logged at INFO."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    app = create_app(manager.config, "secret", manager)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        headers = {"Authorization": "Bearer secret"}
+        reason = "rule triggered: rate limit exceeded; content: provider.rate-limit: Error: Rate limit exceeded"
+        response = await client.post(
+            "/rotate", headers=headers, json={"reason": reason}
+        )
+        assert response.status_code == 200
+        # Verify the reason was logged at INFO level
+        assert any("Tunnel rotation requested" in r.message for r in caplog.records)
+        # Verify the reason appears in the log (sanitized)
+        log_messages = [
+            r.message
+            for r in caplog.records
+            if "Tunnel rotation requested" in r.message
+        ]
+        assert len(log_messages) == 1
+        assert "rule triggered" in log_messages[0]
+    await manager.close()
+
+
+async def test_rotate_rejected_before_logging(caplog):
+    """When rotation is rejected (busy/cooldown), the reason should NOT be logged."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    cfg = config()
+    manager = TunnelManager(cfg)
+    app = create_app(cfg, "secret", manager)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        headers = {"Authorization": "Bearer secret"}
+        # First rotation succeeds
+        await client.post("/rotate", headers=headers, json={"reason": "first"})
+        # Make it busy
+        manager._busy = True
+        # Second rotation should be rejected and NOT log the reason
+        response = await client.post(
+            "/rotate", headers=headers, json={"reason": "should not log"}
+        )
+        assert response.status_code == 429
+        # Verify no INFO log for "should not log"
+        log_messages = [
+            r.message for r in caplog.records if "should not log" in r.message
+        ]
+        assert len(log_messages) == 0
+        # But the first rotation's reason should be logged
+        log_messages = [
+            r.message
+            for r in caplog.records
+            if "first" in r.message and "Tunnel rotation requested" in r.message
+        ]
+        assert len(log_messages) == 1
+    await manager.close()
+
+
 async def test_real_socks_handshake():
     async def socks(reader, writer):
         assert await reader.readexactly(3) == b"\x05\x01\x00"
