@@ -221,6 +221,7 @@ class TunnelManager:
         pre_connect: Callable[[], None] | None = None,
         *,
         ignore_cooldown: bool = False,
+        reason: str | None = None,
     ) -> dict:
         """Connect through the next server, falling back to the rest of the list.
 
@@ -229,7 +230,11 @@ class TunnelManager:
         unlocks are one atomic step in the service event loop.
         ``ignore_cooldown`` skips the cooldown but keeps the busy gate, which
         is what the interactive rotate key uses.
+        ``reason`` is an optional string explaining why the rotation was triggered
+        (e.g., from a client detecting rate limits).
         """
+        if reason:
+            logger.info("Tunnel rotation requested: %s", reason)
         # No await before admission: atomic within the single service event loop.
         self._admit(cooldown=not ignore_cooldown)
         return await self._change(self._rotate_across_servers, pre_connect)
