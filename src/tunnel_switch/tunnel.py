@@ -234,8 +234,6 @@ class TunnelManager:
         ``reason`` is an optional string explaining why the rotation was triggered
         (e.g., from a client detecting rate limits).
         """
-        if reason:
-            logger.info("Tunnel rotation requested: %s", reason)
         # No await before admission: atomic within the single service event loop.
         self._admit(cooldown=not ignore_cooldown)
         if reason:
