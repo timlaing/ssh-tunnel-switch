@@ -522,6 +522,12 @@ async def test_rotate_rejected_before_logging(manager, caplog):
     """When rotation is rejected (busy/cooldown), the reason should NOT be logged."""
     import logging
 
+    # Clear any existing handlers on the tunnel logger to avoid duplicate logs
+    # from module reloading in CI with coverage
+    tunnel_logger = logging.getLogger("tunnel_switch.tunnel")
+    for handler in tunnel_logger.handlers[:]:
+        tunnel_logger.removeHandler(handler)
+
     caplog.set_level(logging.INFO)
     app = create_app(manager.config, "secret", manager)
     async with httpx.AsyncClient(
