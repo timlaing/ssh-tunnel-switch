@@ -45,8 +45,18 @@ jobs:
       - name: Install test and packaging dependencies
         run: >-
           python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
+      - name: Clean Python cache
+        run: find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
       - name: Test standalone service and proxy
-        run: PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml -k "not test_rotate_rejected_before_logging"
+      - name: Test rotate rejected logging (without coverage)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          PYTHONPATH=src python -m pytest -q tests/test_service.py::test_rotate_rejected_before_logging
       - name: Normalize Python coverage paths to repository root
         run: |
           python3 - <<'PYCODE'

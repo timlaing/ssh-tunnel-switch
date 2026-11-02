@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
@@ -237,6 +238,10 @@ class TunnelManager:
             logger.info("Tunnel rotation requested: %s", reason)
         # No await before admission: atomic within the single service event loop.
         self._admit(cooldown=not ignore_cooldown)
+        if reason:
+            # Sanitize: trim, collapse whitespace, truncate to 500 chars.
+            msg = re.sub(r"\s+", " ", reason.strip())[:500]
+            logger.info("Tunnel rotation requested: %s", msg)
         return await self._change(self._rotate_across_servers, pre_connect)
 
     async def select_server(
