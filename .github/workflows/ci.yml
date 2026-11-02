@@ -50,7 +50,13 @@ jobs:
       - name: Test standalone service and proxy
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml
+        run: |
+          PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml -k "not test_rotate_rejected_before_logging"
+      - name: Test rotate rejected logging (without coverage)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          PYTHONPATH=src python -m pytest -q tests/test_service.py::test_rotate_rejected_before_logging
       - name: Normalize Python coverage paths to repository root
         run: |
           python3 - <<'PYCODE'
