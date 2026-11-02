@@ -239,7 +239,7 @@ class TunnelManager:
         if reason:
             # Sanitize: trim, collapse whitespace, truncate to 500 chars.
             msg = re.sub(r"\s+", " ", reason.strip())[:500]
-            logger.info("Tunnel rotation requested: %s", msg)
+            logger.info("Tunnel rotation requested [v3]: %s", msg)
         return await self._change(self._rotate_across_servers, pre_connect)
 
     async def select_server(
