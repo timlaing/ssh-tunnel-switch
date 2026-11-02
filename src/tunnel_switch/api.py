@@ -157,6 +157,12 @@ def _register_routes(app, manager, authorize, config_path, watch):
             reason = body.get("reason") if isinstance(body, dict) else None
         except Exception:
             pass
+        logger.debug(
+            "API rotate: pending=%s, reason=%r, manager._busy=%s",
+            pending,
+            reason,
+            manager._busy,
+        )
         try:
             return await manager.rotate(pending, reason=reason)
         except RotationRejected as exc:

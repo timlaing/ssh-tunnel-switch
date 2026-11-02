@@ -87,7 +87,9 @@ class TunnelManager:
         interactive key is a deliberate request from the person watching the
         panel, so it must not be refused for having just rotated.
         """
+        logger.debug("_admit: _busy=%s, cooldown=%s", self._busy, cooldown)
         if self._busy:
+            logger.debug("_admit: rejecting, _busy=True")
             raise RotationRejected("Tunnel rotation already in progress")
         if not cooldown:
             return
@@ -235,7 +237,9 @@ class TunnelManager:
         (e.g., from a client detecting rate limits).
         """
         # No await before admission: atomic within the single service event loop.
+        logger.debug("rotate: _busy=%s, reason=%r", self._busy, reason)
         self._admit(cooldown=not ignore_cooldown)
+        logger.debug("rotate: admitted, _busy=%s", self._busy)
         if reason:
             # Sanitize: trim, collapse whitespace, truncate to 500 chars.
             msg = re.sub(r"\s+", " ", reason.strip())[:500]
