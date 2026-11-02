@@ -4,7 +4,7 @@ import logging
 import secrets
 import signal
 from typing import Callable, Sequence
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from . import __version__
 from .config import Config
 from .counters import RequestCounter
@@ -144,14 +144,21 @@ def _register_routes(app, manager, authorize, config_path, watch):
             503: {"description": "SSH tunnel could not be established"},
         },
     )
-    async def rotate():
+    async def rotate(request: Request):
         reloader = app.state.reloader
         # A rotation creates a fresh ssh process, so a deferred SOCKS bind
         # becomes live there — but only once the rotation is admitted: a
         # rejected request must leave the still-running bind untouched.
         pending = reloader.apply_pending_binds if reloader is not None else None
+        # Read optional reason from request body
+        reason = None
         try:
-            return await manager.rotate(pending)
+            body = await request.json()
+            reason = body.get("reason") if isinstance(body, dict) else None
+        except Exception:
+            pass
+        try:
+            return await manager.rotate(pending, reason=reason)
         except RotationRejected as exc:
             raise HTTPException(
                 status_code=429,
