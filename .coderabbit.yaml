@@ -4,5 +4,6 @@ reviews:
   profile: assertive
   request_changes_workflow: true
   auto_review:
-    enabled: true
-    auto_incremental_review: true
+    enabled: false
+    auto_incremental_review: false
+    description_keyword: ""
