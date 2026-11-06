@@ -44,7 +44,7 @@ jobs:
       - name: Request reviews after successful checks
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          REQUIRED_CHECKS: '["Python 3.12 / ubuntu-latest", "Python 3.13 / ubuntu-latest", "Python 3.14 / ubuntu-latest", "Python 3.13 / macos-14", "Deployment unit syntax", "Real SSH integration", "Python lint", "Python security analysis"]'
+          REQUIRED_CHECKS: '["Python 3.12 / ubuntu-latest", "Python 3.13 / ubuntu-latest", "Python 3.14 / ubuntu-latest", "Python 3.13 / macos-latest", "Deployment unit syntax", "Real SSH integration", "Python lint", "Python security analysis"]'
         with:
           script: |
             const { owner, repo } = context.repo;
