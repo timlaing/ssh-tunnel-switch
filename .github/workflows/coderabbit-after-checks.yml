@@ -16,8 +16,6 @@ on:
         "Synchronize labels",
       ]
     types: [completed]
-  schedule:
-    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 permissions: {}
