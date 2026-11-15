@@ -651,6 +651,14 @@ asyncio.run(main())
         assert first["connection_id"] != second["connection_id"]
         assert old.returncode is not None
         assert await manager._ready()
+        start_recovery(manager)
+        failed = manager.process
+        failed.terminate()
+        await failed.wait()
+        await wait_for_condition(manager.adopted)
+        assert manager.status()["server"] == second["server"]
+        assert manager.status()["connection_id"] != second["connection_id"]
+        assert await manager._ready()
     finally:
         await manager.close()
     assert manager.status()["state"] == "disconnected"
@@ -1253,3 +1261,347 @@ async def test_readiness_retries_after_transient_probe_timeout(
     assert open_connection.await_count == 2
     assert writer.wait_closed.await_count == (1 if timeout_stage == "connect" else 2)
     assert manager.process.returncode is None
+
+
+async def wait_for_condition(predicate):
+    async with asyncio.timeout(5):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+def start_recovery(manager, pre_connect=None):
+    manager.config.reconnect_delay_seconds = 0.01
+    manager.config.reconnect_max_delay_seconds = 0.04
+    manager.start_monitor(pre_connect, interval=0.005)
+
+
+async def test_auto_reconnect_retries_current_server_without_cooldown(manager):
+    manager.config.cooldown_seconds = 30
+    first = await manager.select_server("two")
+    manager.counter.record()
+    start_recovery(manager)
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(lambda: manager.adopted())
+        recovered = manager.status()
+        assert recovered["server"] == "two"
+        assert recovered["connection_id"] != first["connection_id"]
+        assert recovered["requests"] == {"current": 0, "last": 1}
+        assert recovered["last_error"] is None
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_fails_over_and_applies_pending_bind(manager, monkeypatch):
+    await manager.rotate()
+    spawn = AsyncMock(side_effect=[exited_ssh(), Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    pending = []
+
+    def apply_bind():
+        assert manager.busy
+        manager.config.proxy.port = 1081
+        pending.append(True)
+
+    start_recovery(manager, apply_bind)
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(manager.adopted)
+        assert manager.status()["server"] == "two"
+        assert spawn.await_count == 2
+        assert pending == [True]
+        assert "127.0.0.1:1081" in spawn.call_args.args
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_backoff_is_capped_and_survives_outage(
+    manager, monkeypatch, caplog
+):
+    await manager.rotate()
+    spawn = AsyncMock(side_effect=[exited_ssh() for _ in range(8)] + [Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    start_recovery(manager)
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(manager.adopted)
+        assert spawn.await_count == 9
+        retries = [
+            record.args[0]
+            for record in caplog.records
+            if record.msg.startswith("Tunnel reconnection failed")
+        ]
+        assert retries == [0.01, 0.02, 0.04, 0.04]
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_respects_disconnect_and_manual_reconnect(
+    manager, monkeypatch
+):
+    await manager.rotate()
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process(), Process()]),
+    )
+    start_recovery(manager)
+    manager.config.reconnect_delay_seconds = 0.2
+    manager.config.reconnect_max_delay_seconds = 0.2
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(lambda: manager.last_error is not None)
+        await manager.disconnect()
+        await asyncio.sleep(0.25)
+        assert manager.process is None
+        assert (await manager.restart())["server"] == "two"
+        manager.process.returncode = 255
+        await wait_for_condition(manager.adopted)
+        assert manager.status()["server"] == "two"
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_does_not_start_an_intentionally_idle_service(manager):
+    start_recovery(manager)
+    try:
+        await asyncio.sleep(0.08)
+        assert manager.process is None
+        assert not manager._attempted
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_can_be_disabled_and_reenabled_live(manager):
+    await manager.rotate()
+    manager.config.reconnect_attempts = 0
+    start_recovery(manager)
+    try:
+        dead = manager.process
+        dead.returncode = 255
+        await asyncio.sleep(0.08)
+        assert manager.process is dead
+        manager.config.reconnect_attempts = 5
+        await wait_for_condition(manager.adopted)
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_resolves_server_identity_after_reload(manager):
+    await manager.rotate()
+    manager.config = manager.config.model_copy(deep=True)
+    manager.config.servers.reverse()
+    start_recovery(manager)
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(manager.adopted)
+        assert manager.status()["server"] == "one"
+    finally:
+        await manager.close()
+
+
+async def test_manual_selection_supersedes_a_pending_auto_reconnect(
+    manager, monkeypatch
+):
+    await manager.rotate()
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process()]),
+    )
+    start_recovery(manager)
+    manager.config.reconnect_delay_seconds = 0.2
+    manager.config.reconnect_max_delay_seconds = 0.2
+    try:
+        manager.process.returncode = 255
+        await wait_for_condition(lambda: manager.last_error is not None)
+        selected = await manager.select_server("two")
+        await asyncio.sleep(0.25)
+        assert manager.status()["connection_id"] == selected["connection_id"]
+        assert manager.status()["server"] == "two"
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_attempts_immediately_before_backoff(manager):
+    await manager.rotate()
+    # A long backoff must not delay the first attempt after either disconnection.
+    manager.config.reconnect_delay_seconds = 60
+    manager.config.reconnect_max_delay_seconds = 60
+    manager.start_monitor(interval=0.005)
+    try:
+        for _ in range(2):
+            previous = manager.status()["connection_id"]
+            manager.process.returncode = 255
+            async with asyncio.timeout(1):
+                await wait_for_condition(manager.adopted)
+            assert manager.status()["connection_id"] != previous
+            assert manager.status()["server"] == "one"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize("budget", [0, 1, 5])
+async def test_auto_reconnect_limits_attempts_per_outage(
+    manager, monkeypatch, caplog, budget
+):
+    await manager.rotate()
+    manager.config.reconnect_attempts = budget
+    spawn = AsyncMock(side_effect=lambda *args, **kwargs: exited_ssh())
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    start_recovery(manager)
+    manager.process.returncode = 255
+    try:
+        if budget:
+            await wait_for_condition(
+                lambda: spawn.await_count == budget * 2 and not manager.busy
+            )
+        await asyncio.sleep(0.15)
+        assert spawn.await_count == budget * 2
+        assert manager.status()["state"] == "disconnected"
+        exhausted = [
+            record for record in caplog.records if "exhausted" in record.getMessage()
+        ]
+        assert len(exhausted) == (1 if budget else 0)
+    finally:
+        await manager.close()
+
+
+async def test_manual_connection_resets_exhausted_recovery_budget(manager, monkeypatch):
+    await manager.rotate()
+    manager.config.reconnect_attempts = 1
+    spawn = AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process(), Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    start_recovery(manager)
+    manager.process.returncode = 255
+    try:
+        await wait_for_condition(lambda: spawn.await_count == 2 and not manager.busy)
+        await manager.select_server("one")
+        manager.process.returncode = 255
+        await wait_for_condition(manager.adopted)
+        assert spawn.await_count == 4
+    finally:
+        await manager.close()
+
+
+async def test_live_retry_budget_increase_resumes_exhausted_recovery(
+    manager, monkeypatch
+):
+    await manager.rotate()
+    manager.config.reconnect_attempts = 1
+    spawn = AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    start_recovery(manager)
+    manager.process.returncode = 255
+    try:
+        await wait_for_condition(lambda: spawn.await_count == 2 and not manager.busy)
+        manager.config.reconnect_attempts = 2
+        await wait_for_condition(manager.adopted)
+        assert spawn.await_count == 3
+    finally:
+        await manager.close()
+
+
+async def test_auto_reconnect_waits_for_a_busy_manual_change(manager):
+    await manager.rotate()
+    start_recovery(manager)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def ready():
+        entered.set()
+        await release.wait()
+        return True
+
+    manager._ready = ready
+    task = asyncio.create_task(manager.select_server("two"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        process = manager.process
+        await asyncio.sleep(0.08)
+        assert manager.process is process
+        assert not process.terminated
+        release.set()
+        assert (await task)["server"] == "two"
+    finally:
+        release.set()
+        await task
+        await manager.close()
+
+
+async def test_close_cancels_an_in_progress_auto_reconnect(manager):
+    await manager.rotate()
+    entered = asyncio.Event()
+
+    async def ready():
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager._ready = ready
+    start_recovery(manager)
+    task = manager._monitor_task
+    manager.process.returncode = 255
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        process = manager.process
+    finally:
+        await manager.close()
+    assert task.done()
+    assert process.terminated
+    assert manager.process is None
+    assert not manager.busy
+
+
+async def test_lifespan_keeps_api_up_after_initial_tunnel_failure(manager, monkeypatch):
+    manager.config.start_on_launch = True
+    spawn = AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    manager.config.reconnect_delay_seconds = 0.01
+    application = create_app(manager.config, "secret", manager)
+    async with application.router.lifespan_context(application):
+        assert manager.status()["state"] == "disconnected"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://test"
+        ) as client:
+            response = await client.get(
+                "/status", headers={"Authorization": "Bearer secret"}
+            )
+            assert response.status_code == 200
+        await wait_for_condition(manager.adopted)
+    assert manager.process is None
+    assert manager._monitor_task is None
+
+
+async def test_lifespan_still_fails_startup_when_recovery_disabled(
+    manager, monkeypatch
+):
+    manager.config.start_on_launch = True
+    manager.config.reconnect_attempts = 0
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=[exited_ssh(), exited_ssh()]),
+    )
+    application = create_app(manager.config, "secret", manager)
+    with pytest.raises(TunnelFailure):
+        async with application.router.lifespan_context(application):
+            pytest.fail("Startup should have failed")
+    assert manager.process is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reconnect_delay_seconds": 0},
+        {"reconnect_max_delay_seconds": 0},
+        {"reconnect_delay_seconds": 10, "reconnect_max_delay_seconds": 5},
+        {"reconnect_attempts": -1},
+        {"reconnect_attempts": 1.5},
+    ],
+)
+def test_reconnect_configuration_rejects_invalid_delays(changes):
+    with pytest.raises(ValidationError):
+        config(**changes)
+
+
+def test_reconnect_attempt_budget_defaults_to_five():
+    assert config().reconnect_attempts == 5

@@ -6,19 +6,22 @@ Use `tunnel-switch init-config --output config.yaml` to create the [example YAML
 
 Edit `config.yaml` with your SSH host aliases and the SOCKS, HTTP proxy and API bind IP/port. Only `host` is required for each SSH server. `name` defaults to `host`; `user`, `port` and `identity_file` are optional overrides. When omitted (or null), the SSH command leaves them unset, so the system SSH client inherits settings from `~/.ssh/config` for the account running the service. Without configured SSH values, OpenSSH uses its own defaults. Identity paths relative to the YAML file resolve from its directory; `~` expands. YAML is required for service commands (the `init-config` command creates an example). Unknown fields, invalid IPs/ports, duplicate server names and missing identity files are rejected.
 
-| YAML field                | Default                                                            | Purpose                                                                                           |
-| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| `servers`                 | Required nonempty list                                             | SSH aliases and optional per-server overrides                                                     |
-| `proxy`                   | Required section                                                   | SSH SOCKS listener; `ip` defaults to `127.0.0.1`, `port` to `1080`                                |
-| `http_proxy`              | Enabled at `127.0.0.1:8118`                                        | HTTP forwarding and HTTPS CONNECT listener; see the proxy section below                           |
-| `api`                     | `127.0.0.1:8765`                                                   | REST bind address and optional `token`; missing tokens are generated on startup                   |
-| `logging`                 | File `~/.config/ssh-tunnel-switch/tunnel-switch.log`, level `INFO` | Timestamped service and HTTP access logs; see the logging section below                           |
-| `cooldown_seconds`        | `30`                                                               | Minimum time after a completed or failed rotation before the next attempt; zero disables cooldown |
-| `startup_timeout_seconds` | `15`                                                               | SSH connection/readiness deadline, greater than zero and at most 120 seconds                      |
-| `stop_timeout_seconds`    | `5`                                                                | Wait before forcibly killing an SSH process, greater than zero and at most 60 seconds             |
-| `start_on_launch`         | `true`                                                             | Start the saved SSH server (or the first server without saved state) when the API starts          |
-| `state_file`              | `~/.config/ssh-tunnel-switch/state.json`                           | Last successfully connected server; `null` disables persistence                                   |
-| `server_name`             | `null`                                                             | Optional starting server name, overriding saved state                                             |
+| YAML field                    | Default                                                            | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `servers`                     | Required nonempty list                                             | SSH aliases and optional per-server overrides                                                     |
+| `proxy`                       | Required section                                                   | SSH SOCKS listener; `ip` defaults to `127.0.0.1`, `port` to `1080`                                |
+| `http_proxy`                  | Enabled at `127.0.0.1:8118`                                        | HTTP forwarding and HTTPS CONNECT listener; see the proxy section below                           |
+| `api`                         | `127.0.0.1:8765`                                                   | REST bind address and optional `token`; missing tokens are generated on startup                   |
+| `logging`                     | File `~/.config/ssh-tunnel-switch/tunnel-switch.log`, level `INFO` | Timestamped service and HTTP access logs; see the logging section below                           |
+| `cooldown_seconds`            | `30`                                                               | Minimum time after a completed or failed rotation before the next attempt; zero disables cooldown |
+| `startup_timeout_seconds`     | `15`                                                               | SSH connection/readiness deadline, greater than zero and at most 120 seconds                      |
+| `stop_timeout_seconds`        | `5`                                                                | Wait before forcibly killing an SSH process, greater than zero and at most 60 seconds             |
+| `start_on_launch`             | `true`                                                             | Start the saved SSH server (or the first server without saved state) when the API starts          |
+| `reconnect_attempts`          | `5`                                                                | Recovery attempts per outage, including the immediate attempt; `0` disables recovery              |
+| `reconnect_delay_seconds`     | `5`                                                                | Delay after the first failed recovery attempt, greater than zero and at most 3600 seconds         |
+| `reconnect_max_delay_seconds` | `60`                                                               | Backoff cap, at least the initial delay and at most 3600 seconds                                  |
+| `state_file`                  | `~/.config/ssh-tunnel-switch/state.json`                           | Last successfully connected server; `null` disables persistence                                   |
+| `server_name`                 | `null`                                                             | Optional starting server name, overriding saved state                                             |
 
 A host-only server list can use existing SSH config aliases:
 
@@ -48,6 +51,41 @@ No token environment variable is used. `status` and `rotate` read the saved YAML
 
 Run exactly one service process for a given SOCKS socket. The supplied CLI uses one Uvicorn worker; its configuration is reloaded live (see below), not by restarting the worker. It manages only SSH processes it spawned. An existing process occupying the SOCKS address is rejected rather than terminated. The cooldown also applies after startup and failed rotations, so an immediate rotation within the default 30 seconds returns 429.
 
+## Automatic reconnection
+
+By default the service watches its SSH subprocess for exits and reconnects
+immediately on detecting a disconnection (checked every second), without an
+initial retry delay. OpenSSH keepalives (`ServerAliveInterval=15`,
+`ServerAliveCountMax=3`) detect an unresponsive connection, typically after about
+45 seconds; recovery starts once SSH exits. A brief blip that SSH survives does
+not create a new session.
+
+Recovery tries the previously connected server first, then the other configured
+servers. If every server fails, retries wait `reconnect_delay_seconds`, then the
+delay doubles up to `reconnect_max_delay_seconds`
+(default attempt timings: immediate, then delays of 5, 10, 20 and 40 seconds).
+Each recovery attempt tries every configured server at most once. Recovery stops
+after `reconnect_attempts` failed attempts (default 5), leaving the tunnel
+disconnected and logging exhaustion. A new manual connection request resets the
+budget; a successful connection resets both the budget and backoff and
+gets a fresh connection ID and request counter. Recovery bypasses the manual
+rotation cooldown but never overlaps another connection change. Deferred SOCKS
+bind changes are applied before recovery connects.
+
+With recovery enabled, a failed startup connection leaves the API and HTTP proxy
+running while SSH is retried. Failed manual connection attempts also enable
+recovery; an explicit server selection tries only that server immediately, but
+subsequent automatic recovery may fail over. Ctrl+D disables recovery until a
+new connection is requested, and `start_on_launch: false` stays idle until then.
+Shutdown cancels pending or in-progress recovery and stops SSH. Setting
+`reconnect_attempts: 0` disables recovery and restores
+startup failure on an SSH connection error. Recovery settings can be reloaded live; a delay
+already scheduled keeps its deadline, with new values used for subsequent retries.
+Increasing the attempt budget allows an exhausted outage to retry again.
+
+Existing proxied connections cannot survive an SSH restart; clients must retry
+failed requests. The proxy never falls back to a direct internet connection.
+
 ## Reloading configuration
 
 `serve` watches the YAML file it was started with and applies changes without
@@ -71,7 +109,8 @@ stop the service or drop the tunnel. CLI startup overrides (`--state-file`,
 Applied immediately:
 
 - `servers` (used by the next rotation), `cooldown_seconds`,
-  `startup_timeout_seconds`, `stop_timeout_seconds`
+  `startup_timeout_seconds`, `stop_timeout_seconds`,
+  `reconnect_attempts`, `reconnect_delay_seconds`, `reconnect_max_delay_seconds`
 - `api.token`, so a rotated token takes effect on the next request
 - `state_file`, `logging.file` and `logging.level` (the log handlers are
   rebuilt)
@@ -237,7 +276,7 @@ total starts again whenever the tunnel connects to another server, and a tunnel
 that exits on its own reports its own total as the last value until the next
 connection replaces it.
 
-Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. There is no automatic restart loop.
+Overlapping rotations and cooldown violations return **429**, with `Retry-After`; callers must trigger again later. They are not queued. A rotation begins with the next server and, when that server exits SSH without becoming ready, moves straight on to the following server: each server is tried at most once, with no cooldown in between, and the rotation stops at the first one that accepts the connection. Only when every server has failed does the request return **503**, leaving the service disconnected, recording the last failure in `last_error` and naming every attempt in the log. A rotation therefore waits at most `startup_timeout_seconds` for each server it has to fall through. The cooldown covers the rotation as a whole, so it applies after a failed rotation too. A single-server list restarts the same server. Status remains responsive during rotation and returns `state: "rotating"`; connection ID/start time are null until the new tunnel is ready. After SSH exits, status reports disconnected and clears active connection fields. Automatic recovery retries unless disabled or intentionally disconnected.
 
 `POST /reload` returns **429** while a rotation is in progress — including one
 that starts while the file is being validated, after the entry check passed —

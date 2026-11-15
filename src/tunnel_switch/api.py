@@ -75,8 +75,19 @@ def _lifespan(config, manager, proxy, watch):
         poller = _start_reload(app, loop, stop, watch)
         try:
             if config.start_on_launch:
-                await manager.rotate()
+                try:
+                    await manager.rotate()
+                except TunnelFailure:
+                    if manager.config.reconnect_attempts == 0:
+                        raise
+                    logger.warning(
+                        "Initial tunnel connection failed; automatic recovery will retry"
+                    )
             await proxy.start()
+            reloader = app.state.reloader
+            manager.start_monitor(
+                reloader.apply_pending_binds if reloader is not None else None
+            )
             yield
         finally:
             try:

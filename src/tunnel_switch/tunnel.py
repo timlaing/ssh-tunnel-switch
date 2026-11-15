@@ -65,6 +65,13 @@ class TunnelManager:
         # False until the first connection attempt: before that, "the current
         # server" is the one a rotation would pick, not one we have tried.
         self._attempted = False
+        # Desired state is separate from process liveness: an exited SSH should
+        # recover, but an intentional disconnect (or idle launch) should not.
+        self._want_connection = False
+        # Manual changes invalidate any retry deadline/backoff the monitor held.
+        self._generation = 0
+        self._reconnect_server = None
+        self._monitor_task = None
 
     @property
     def busy(self) -> bool:
@@ -292,6 +299,8 @@ class TunnelManager:
         if self._busy:
             raise RotationRejected("Tunnel rotation already in progress")
         self._busy = True
+        self._want_connection = False
+        self._generation += 1
         try:
             await self._stop()
         finally:
@@ -301,9 +310,17 @@ class TunnelManager:
         return self.status()
 
     async def _change(
-        self, connect, pre_connect: Callable[[], None] | None = None
+        self,
+        connect,
+        pre_connect: Callable[[], None] | None = None,
+        *,
+        recovery: bool = False,
     ) -> dict:
         self._busy = True
+        if not recovery:
+            self._want_connection = True
+            self._generation += 1
+            self._reconnect_server = None
         self.last_error = None
         try:
             if pre_connect is not None:
@@ -417,6 +434,7 @@ class TunnelManager:
             await self._stop()
             raise TunnelFailure(str(exc)) from exc
         logger.info("Tunnel connected to SSH server %s (%s)", server.name, server.host)
+        self._reconnect_server = (server.name, server.host)
 
     async def _connect(self, server: Server):
         """Start SSH for *server* and wait until it proxies, or raise."""
@@ -471,5 +489,98 @@ class TunnelManager:
             await save
             raise
 
+    def start_monitor(
+        self, pre_connect: Callable[[], None] | None = None, *, interval: float = 1.0
+    ) -> None:
+        """Watch SSH exits until close(), including while auto recovery is disabled."""
+        if self._monitor_task is None:
+            self._monitor_task = asyncio.create_task(
+                self._monitor(pre_connect, interval)
+            )
+
+    async def _monitor(self, pre_connect, interval: float) -> None:
+        generation = None
+        retry_at = None
+        attempts = 0
+        delay = self.config.reconnect_delay_seconds
+        while True:
+            await asyncio.sleep(interval)
+            if generation != self._generation:
+                generation = self._generation
+                retry_at = None
+                attempts = 0
+                delay = self.config.reconnect_delay_seconds
+            if self._busy:
+                continue
+            if (
+                not self._want_connection
+                or self.config.reconnect_attempts == 0
+                or self.adopted()
+            ):
+                retry_at = None
+                attempts = 0
+                delay = self.config.reconnect_delay_seconds
+                continue
+            if attempts >= self.config.reconnect_attempts:
+                continue
+            if retry_at is None:
+                if self.process is not None and self.process.returncode is not None:
+                    self.last_error = (
+                        f"SSH tunnel exited with code {self.process.returncode}"
+                    )
+                delay = self.config.reconnect_delay_seconds
+                logger.warning("Tunnel disconnected; reconnecting immediately")
+            elif time.monotonic() < retry_at:
+                continue
+            # Resolve by identity, not the old list index: a reload may have
+            # reordered or removed the previously connected server.
+            first = next(
+                (
+                    i
+                    for i, server in enumerate(self.config.servers)
+                    if (server.name, server.host) == self._reconnect_server
+                ),
+                self._index % len(self.config.servers),
+            )
+            self._admit(cooldown=False)
+            attempts += 1
+            try:
+                await self._change(
+                    lambda: self._rotate_across_servers(first_index=first),
+                    pre_connect,
+                    recovery=True,
+                )
+            except Exception as exc:
+                self.last_error = str(exc)
+                retry_at = time.monotonic() + delay
+                if attempts >= self.config.reconnect_attempts:
+                    logger.warning(
+                        "Tunnel reconnection failed; exhausted %d recovery attempts: %s",
+                        attempts,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "Tunnel reconnection failed; retrying in %.1f seconds: %s",
+                        delay,
+                        exc,
+                    )
+                delay = min(delay * 2, self.config.reconnect_max_delay_seconds)
+            else:
+                retry_at = None
+                attempts = 0
+                delay = self.config.reconnect_delay_seconds
+
     async def close(self):
-        await self._stop()
+        self._want_connection = False
+        self._generation += 1
+        task, self._monitor_task = self._monitor_task, None
+        try:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            await self._stop()

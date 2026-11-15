@@ -25,4 +25,4 @@ Start with `tunnel-switch validate --config /path/to/config.yaml`, then check SS
 
 Use direct REST calls when diagnosing routing: `curl --noproxy '*' -H 'Authorization: Bearer <token>' http://127.0.0.1:8765/status`. Do not share the real token, private keys, hostnames or unredacted journal output.
 
-The service does not automatically restart an exited SSH subprocess while the API remains running. Diagnose the failure and request rotation after the cooldown. Systemd can restart a failed Python process; that is a different lifecycle.
+The service automatically reconnects exited SSH tunnels immediately on detection by default, making up to 5 recovery attempts per outage with backoff after failures. After exhaustion it stays disconnected until a new connection is requested (or the attempt budget is increased). Check `last_error` and the logs for repeated SSH failures. OpenSSH keepalives may take about 45 seconds to detect a dead connection before recovery begins. Intentional disconnects stay stopped; `reconnect_attempts: 0` disables recovery. Existing proxy connections must be retried by clients. Systemd restarting a failed Python process is a separate lifecycle.

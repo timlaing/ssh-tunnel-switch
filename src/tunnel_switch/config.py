@@ -81,6 +81,9 @@ class Config(StrictModel):
     startup_timeout_seconds: float = Field(default=15, gt=0, le=120)
     stop_timeout_seconds: float = Field(default=5, gt=0, le=60)
     start_on_launch: bool = True
+    reconnect_attempts: int = Field(default=5, ge=0)
+    reconnect_delay_seconds: float = Field(default=5, gt=0, le=3600)
+    reconnect_max_delay_seconds: float = Field(default=60, gt=0, le=3600)
     state_file: Path | None = Field(
         default_factory=lambda: Path(
             "~/.config/ssh-tunnel-switch/state.json"
@@ -90,6 +93,10 @@ class Config(StrictModel):
 
     @model_validator(mode="after")
     def unique_names(self):
+        if self.reconnect_max_delay_seconds < self.reconnect_delay_seconds:
+            raise ValueError(
+                "reconnect_max_delay_seconds must be at least reconnect_delay_seconds"
+            )
         if self.server_name is not None and self.server_name not in {
             server.name for server in self.servers
         }:

@@ -48,6 +48,8 @@ The service watches its YAML and applies configuration changes without restartin
 
 ## Use the proxy
 
+Tunnel failures automatically reconnect immediately on detection, trying the current server first and then the other servers. Recovery makes up to 5 attempts per outage, backing off after failures (5, 10, 20, 40 seconds by default; capped at 60 for larger budgets). Intentional disconnects stay stopped; set `reconnect_attempts: 0` to disable recovery.
+
 ```sh
 curl --proxy http://127.0.0.1:8118 https://example.com/
 .venv/bin/tunnel-switch status --config config.yaml
