@@ -458,6 +458,9 @@ class TunnelManager:
         # move on to another server, since the same state file would fail.
         try:
             await self._remember_server(server)
+        except asyncio.CancelledError:
+            await self._stop()
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             logger.exception(
@@ -522,8 +525,12 @@ class TunnelManager:
         )
         try:
             await asyncio.shield(save)
-        except asyncio.CancelledError:
-            await save
+        except asyncio.CancelledError as cancelled:
+            try:
+                await save
+            except Exception as exc:
+                logger.exception("Tunnel state save failed during cancellation")
+                raise cancelled from exc
             raise
 
     def start_monitor(
@@ -546,27 +553,23 @@ class TunnelManager:
         generation = None
         retry_at = None
         attempts = 0
-        delay = self.config.reconnect_delay_seconds
         while True:
             await asyncio.sleep(interval)
             if generation != self._generation:
                 generation = self._generation
                 retry_at = None
                 attempts = 0
-                delay = self.config.reconnect_delay_seconds
             if self._busy:
                 continue
             self._observe_ssh_exit()
             if not self._needs_recovery():
                 retry_at = None
                 attempts = 0
-                delay = self.config.reconnect_delay_seconds
                 continue
             if attempts >= self.config.reconnect_attempts:
                 continue
             if retry_at is None:
                 logger.warning("Tunnel disconnected; reconnecting immediately")
-                delay = self.config.reconnect_delay_seconds
             elif time.monotonic() < retry_at:
                 continue
             self._admit(cooldown=False)
@@ -576,14 +579,22 @@ class TunnelManager:
             except Exception as exc:
                 logger.debug("Tunnel recovery attempt failed", exc_info=True)
                 self.last_error = str(exc)
-                delay = min(delay, self.config.reconnect_max_delay_seconds)
+                delay = self._retry_delay(attempts)
                 retry_at = time.monotonic() + delay
                 self._report_recovery_failure(attempts, delay, exc)
-                delay = min(delay * 2, self.config.reconnect_max_delay_seconds)
             else:
                 retry_at = None
                 attempts = 0
-                delay = self.config.reconnect_delay_seconds
+
+    def _retry_delay(self, failures: int) -> float:
+        """Calculate the next wait from current settings without overflowing."""
+        cap = self.config.reconnect_max_delay_seconds
+        delay = min(self.config.reconnect_delay_seconds, cap)
+        for _ in range(failures - 1):
+            if delay >= cap:
+                return cap
+            delay = min(delay * 2, cap)
+        return delay
 
     def _needs_recovery(self) -> bool:
         return (

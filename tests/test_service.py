@@ -1441,13 +1441,20 @@ async def test_auto_reconnect_backoff_is_capped_and_survives_outage(
         await manager.close()
 
 
-async def test_reload_lower_delay_cap_preserves_deadline_then_caps_next_retry(
+@pytest.mark.parametrize(
+    "reloaded_delay,reloaded_cap,next_delay",
+    [(0.02, 0.02, 0.02), (0.25, 4, 0.5), (2, 4, 4)],
+)
+async def test_reload_retry_delays_preserves_deadline_then_uses_current_values(
     manager,
     monkeypatch,
     tmp_path,
     caplog,
+    reloaded_delay,
+    reloaded_cap,
+    next_delay,
 ):
-    """Keep a scheduled wait but apply a reloaded cap to the following wait."""
+    """Preserve the pending wait and derive later waits from reloaded settings."""
     await manager.rotate()
     manager.config.logging.file = None
     manager.config.reconnect_delay_seconds = 1
@@ -1472,7 +1479,10 @@ async def test_reload_lower_delay_cap_preserves_deadline_then_caps_next_retry(
     try:
         await wait_for_condition(lambda: len(attempts) == 1)
         desired = manager.config.model_dump(mode="json")
-        desired.update(reconnect_delay_seconds=0.02, reconnect_max_delay_seconds=0.02)
+        desired.update(
+            reconnect_delay_seconds=reloaded_delay,
+            reconnect_max_delay_seconds=reloaded_cap,
+        )
         path.write_text(json.dumps(desired))
         outcome = await application.state.reloader.reload_now()
         assert outcome.applied
@@ -1486,12 +1496,12 @@ async def test_reload_lower_delay_cap_preserves_deadline_then_caps_next_retry(
             if record.msg.startswith("Tunnel reconnection failed")
         ]
         assert retries[0] == 1
-        assert retries[1] == 0.02
+        assert retries[1] == next_delay
         assert attempts[1] - attempts[0] == 1
-        clock[0] = 1.01
+        clock[0] = 1 + next_delay / 2
         await asyncio.sleep(0.03)
         assert len(attempts) == 2
-        clock[0] = 1.03
+        clock[0] = 1 + next_delay + 0.01
         await wait_for_condition(lambda: len(attempts) == 3)
     finally:
         await manager.close()
@@ -1841,6 +1851,93 @@ async def test_close_propagates_caller_cancellation_after_cleanup(manager):
         if not close.done():
             close.cancel()
             await asyncio.gather(close, return_exceptions=True)
+
+
+async def test_close_completes_when_cancelled_recovery_state_save_fails(
+    manager,
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    """A persistence failure must not turn shutdown cancellation into a retry."""
+    await manager.rotate()
+    entered, release = threading.Event(), threading.Event()
+    manager.config.state_file = tmp_path / "state.json"
+
+    def failed_save(*_args):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Test did not release the state save")
+        raise OSError("State save failed during shutdown")
+
+    monkeypatch.setattr("tunnel_switch.tunnel.save_last_server", failed_save)
+    start_recovery(manager)
+    monitor = manager._monitor_task
+    manager.process.returncode = 255
+    close = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        process = manager.process
+        close = asyncio.create_task(manager.close())
+        await wait_for_condition(lambda: monitor.cancelling() > 0)
+        release.set()
+        await asyncio.wait_for(close, 2)
+        assert monitor.cancelled()
+        assert process.terminated
+        assert manager.process is None
+        assert manager._monitor_task is None
+        assert not manager.busy
+        assert "Tunnel state save failed during cancellation" in caplog.text
+    finally:
+        release.set()
+        if close is not None:
+            if not close.done():
+                close.cancel()
+            await asyncio.gather(close, return_exceptions=True)
+        await manager.close()
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+async def test_cancelled_selection_state_save_stops_process(
+    manager,
+    monkeypatch,
+    tmp_path,
+    save_fails,
+):
+    """Selection cancellation must stop SSH regardless of persistence outcome."""
+    entered, release = threading.Event(), threading.Event()
+    manager.config.state_file = tmp_path / "state.json"
+
+    def blocked_save(path, server):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Test did not release the state save")
+        if save_fails:
+            raise OSError("State save failed after selection cancellation")
+        save_last_server(path, server)
+
+    monkeypatch.setattr("tunnel_switch.tunnel.save_last_server", blocked_save)
+    selection = asyncio.create_task(manager.select_server("two"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        process = manager.process
+        selection.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await selection
+        if save_fails:
+            assert isinstance(cancelled.value.__cause__, OSError)
+        assert process.terminated
+        assert manager.process is None
+        assert manager.connection_id() is None
+        assert not manager.busy
+    finally:
+        release.set()
+        if not selection.done():
+            selection.cancel()
+        await asyncio.gather(selection, return_exceptions=True)
+        await manager.close()
 
 
 async def test_close_reports_unexpected_monitor_failure_after_cleanup(manager):
