@@ -21,7 +21,8 @@ class RequestCounter:
     last value while no connection is current.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize empty totals before any tunnel connection is adopted."""
         self.current = 0
         self.last = 0
         # True while "current" still belongs to a connection that has not been
@@ -40,7 +41,7 @@ class RequestCounter:
             self.last, self.current = self.current, 0
         self._open = True
 
-    def snapshot(self, *, active: bool) -> dict:
+    def snapshot(self, *, active: bool) -> dict[str, int]:
         """Read the two totals for the panel.
 
         ``active`` says the adopted connection is still the one running. While

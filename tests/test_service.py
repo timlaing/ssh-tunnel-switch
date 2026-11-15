@@ -1,21 +1,53 @@
+"""Verify tunnel lifecycle, recovery, persistence, API, and CLI behavior."""
+
 import asyncio
 import json
+import logging
 import os
-from pathlib import Path
+import socket
+import stat
+import sys
 import threading
-from unittest.mock import AsyncMock
+import tomllib
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import httpx
 import pytest
+from click import unstyle
 from pydantic import ValidationError
 from typer.testing import CliRunner
+
+import tunnel_switch
+from tunnel_switch import __version__
 from tunnel_switch.api import create_app
-from tunnel_switch.cli import app, main
+from tunnel_switch.cli import app, main, resolve_config, serve, settings
 from tunnel_switch.config import Config, load_config
 from tunnel_switch.counters import RequestCounter
-from tunnel_switch.tunnel import TunnelManager, TunnelFailure, RotationRejected
+from tunnel_switch.http_proxy import ProxyError
+from tunnel_switch.state import load_last_server, save_last_server
+from tunnel_switch.tunnel import RotationRejected, TunnelFailure, TunnelManager
+
+PRIVATE_FILE_MODE = 0o600
+DEFAULT_API_PORT = 8765
+MINIMUM_TOKEN_LENGTH = 40
+SERVERS_PER_ROTATION = 2
 
 
-def config(**changes):
+def _equal(actual: object, expected: object) -> None:
+    if actual != expected:
+        pytest.fail(f"Expected {expected!r}, got {actual!r}")
+
+
+def _different(actual: object, previous: object) -> None:
+    if actual == previous:
+        pytest.fail(f"Expected a changed value, still got {actual!r}")
+
+
+def config(**changes: object) -> Config:
+    """Build a two-server configuration without startup or persistence effects."""
     return Config.model_validate(
         {
             "servers": [
@@ -28,119 +60,143 @@ def config(**changes):
             "cooldown_seconds": 0,
             "http_proxy": {"enabled": False},
             **changes,
-        }
+        },
     )
 
 
 class Process:
-    returncode = None
+    """Model the lifecycle of an SSH subprocess without opening sockets."""
 
-    def __init__(self):
+    returncode: int | None = None
+
+    def __init__(self) -> None:
+        """Initialize a running process with observable shutdown flags."""
         self.terminated = False
         self.killed = False
 
-    def terminate(self):
+    def terminate(self) -> None:
+        """Record graceful termination and a successful exit code."""
         self.terminated = True
         self.returncode = 0
 
-    def kill(self):
+    def kill(self) -> None:
+        """Record forced termination and its signal exit code."""
         self.killed = True
         self.returncode = -9
 
-    async def wait(self):
+    async def wait(self) -> int | None:
+        """Return the exit code currently held by this process double."""
         return self.returncode
 
 
 @pytest.fixture
-def manager(monkeypatch):
+def manager(monkeypatch: pytest.MonkeyPatch) -> TunnelManager:
+    """Supply a manager whose sockets and SSH processes are deterministic."""
     manager = TunnelManager(config())
     monkeypatch.setattr(manager, "_ensure_socket_free", lambda: None)
     monkeypatch.setattr(manager, "_ready", AsyncMock(return_value=True))
     monkeypatch.setattr(
         asyncio,
         "create_subprocess_exec",
-        AsyncMock(side_effect=lambda *a, **kw: Process()),
+        AsyncMock(side_effect=lambda *_args, **_kwargs: Process()),
     )
     return manager
 
 
-async def test_rotation_stops_old_and_changes_id(manager):
+async def test_rotation_stops_old_and_changes_id(manager: TunnelManager) -> None:
+    """Stop the old SSH process and publish a new UTC-stamped connection."""
     first = await manager.rotate()
     process = manager.process
     second = await manager.rotate()
-    assert process.terminated
-    assert first["connection_id"] != second["connection_id"]
-    assert first["server"] == "one"
-    assert second["server"] == "two"
-    assert second["started_at"].endswith("+00:00")
+    assert process.terminated, "Rotation must terminate the previous process"
+    _different(first["connection_id"], second["connection_id"])
+    _equal(first["server"], "one")
+    _equal(second["server"], "two")
+    assert second["started_at"].endswith("+00:00"), "Connection timestamps must be UTC"
     manager.process.returncode = 255
-    assert manager.status()["connection_id"] is None
-    await manager.close()
-
-
-async def test_status_reports_one_connection_snapshot(manager):
-    status = await manager.rotate()
-    assert status["connection_id"]
-    assert status["server"] == "one"
-    # The trio is published and cleared as one snapshot, so the status display
-    # thread can never read an ID paired with a missing server name.
-    manager.process.returncode = 255
-    dead = manager.status()
-    assert (dead["connection_id"], dead["server"], dead["started_at"]) == (
-        None,
-        None,
-        None,
+    assert manager.status()["connection_id"] is None, (
+        "Exited SSH must clear its connection ID"
     )
     await manager.close()
 
 
-async def test_request_totals_follow_the_connection(manager):
-    await manager.rotate()
-    # The adopted connection opens its own total.
-    assert manager.status()["requests"] == {"current": 0, "last": 0}
-    for _ in range(3):
-        manager.counter.record()
-    assert manager.status()["requests"] == {"current": 3, "last": 0}
-    await manager.rotate()
-    # The next connection reports its own total beside the previous one.
-    assert manager.status()["requests"] == {"current": 0, "last": 3}
-    manager.counter.record()
-    assert manager.status()["requests"] == {"current": 1, "last": 3}
+async def test_status_reports_one_connection_snapshot(manager: TunnelManager) -> None:
+    """Publish and clear connection identity, server, and timestamp together."""
+    status = await manager.rotate()
+    assert status["connection_id"], "An adopted connection must have an ID"
+    _equal(status["server"], "one")
+    # The trio is published and cleared as one snapshot, so the status display
+    # thread can never read an ID paired with a missing server name.
+    manager.process.returncode = 255
+    dead = manager.status()
+    _equal(
+        (dead["connection_id"], dead["server"], dead["started_at"]),
+        (
+            None,
+            None,
+            None,
+        ),
+    )
     await manager.close()
 
 
-async def test_request_totals_of_a_tunnel_that_exited_report_as_last(manager):
+async def test_request_totals_follow_the_connection(manager: TunnelManager) -> None:
+    """Associate request totals with the current and previous connections."""
+    await manager.rotate()
+    # The adopted connection opens its own total.
+    _equal(manager.status()["requests"], {"current": 0, "last": 0})
+    for _ in range(3):
+        manager.counter.record()
+    _equal(manager.status()["requests"], {"current": 3, "last": 0})
+    await manager.rotate()
+    # The next connection reports its own total beside the previous one.
+    _equal(manager.status()["requests"], {"current": 0, "last": 3})
+    manager.counter.record()
+    _equal(manager.status()["requests"], {"current": 1, "last": 3})
+    await manager.close()
+
+
+async def test_request_totals_of_a_tunnel_that_exited_report_as_last(
+    manager: TunnelManager,
+) -> None:
+    """Report a spontaneously exited tunnel's requests as the last total."""
     await manager.rotate()
     manager.counter.record()
     manager.counter.record()
     manager.process.returncode = 255
     # ssh left on its own: its counts are the last connection's, not current.
-    assert manager.status()["requests"] == {"current": 0, "last": 2}
+    _equal(manager.status()["requests"], {"current": 0, "last": 2})
     await manager.close()
 
 
-async def test_disconnect_keeps_the_finished_total_as_last(manager):
+async def test_disconnect_keeps_the_finished_total_as_last(
+    manager: TunnelManager,
+) -> None:
+    """Retain the finished request total across disconnect and restart."""
     await manager.rotate()
     manager.counter.record()
     manager.counter.record()
-    assert (await manager.disconnect())["requests"] == {"current": 0, "last": 2}
+    _equal((await manager.disconnect())["requests"], {"current": 0, "last": 2})
     # Reconnecting does not restart the previous connection's total.
     restarted = await manager.restart()
-    assert restarted["requests"] == {"current": 0, "last": 2}
+    _equal(restarted["requests"], {"current": 0, "last": 2})
     await manager.close()
 
 
-async def test_status_pairs_the_totals_with_the_connection_they_belong_to(manager):
+async def test_status_pairs_the_totals_with_the_connection_they_belong_to(
+    manager: TunnelManager,
+) -> None:
+    """Keep connection identity and counters consistent during threaded reads."""
     await manager.rotate()
     for _ in range(3):
         manager.counter.record()
     first = manager.status()
     first_id = first["connection_id"]
-    assert first["requests"] == {"current": 3, "last": 0}
+    _equal(first["requests"], {"current": 3, "last": 0})
     observed = []
     stop = threading.Event()
 
-    def read_status():
+    def read_status() -> None:
         while not stop.is_set():
             observed.append(manager.status())
 
@@ -155,19 +211,20 @@ async def test_status_pairs_the_totals_with_the_connection_they_belong_to(manage
     finally:
         stop.set()
         reader.join(timeout=5)
-    assert observed, "the reading thread never observed a status"
+    assert observed, "The reading thread never observed a status"
     for seen in observed:
         if seen["connection_id"] == first_id:
-            assert seen["requests"] == {"current": 3, "last": 0}
+            _equal(seen["requests"], {"current": 3, "last": 0})
         if seen["connection_id"] is None:
-            assert seen["requests"]["current"] == 0
+            _equal(seen["requests"]["current"], 0)
     await manager.close()
 
 
-async def test_concurrent_rotation_rejected(manager):
+async def test_concurrent_rotation_rejected(manager: TunnelManager) -> None:
+    """Reject a second rotation while readiness holds the admission gate."""
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def ready():
+    async def ready() -> bool:
         entered.set()
         await release.wait()
         return True
@@ -177,30 +234,37 @@ async def test_concurrent_rotation_rejected(manager):
     await entered.wait()
     with pytest.raises(RotationRejected, match="in progress"):
         await manager.rotate()
-    assert manager.status()["state"] == "rotating"
+    _equal(manager.status()["state"], "rotating")
     release.set()
     await task
     await manager.close()
 
 
-async def test_restart_reconnects_to_the_same_server(manager):
+async def test_restart_reconnects_to_the_same_server(manager: TunnelManager) -> None:
+    """Restart the current server with a fresh connection identity."""
     await manager.rotate()
     await manager.rotate()
-    assert manager.status()["server"] == "two"
+    _equal(manager.status()["server"], "two")
     previous = manager.status()["connection_id"]
     restarted = await manager.restart()
     # The index is pinned, not advanced: a restart bounces the current server.
-    assert restarted["server"] == "two"
-    assert restarted["connection_id"] != previous
+    _equal(restarted["server"], "two")
+    _different(restarted["connection_id"], previous)
     await manager.close()
 
 
-async def test_restart_without_a_previous_connection_uses_the_first_server(manager):
-    assert (await manager.restart())["server"] == "one"
+async def test_restart_without_a_previous_connection_uses_the_first_server(
+    manager: TunnelManager,
+) -> None:
+    """Use the first server when restarting without a prior connection."""
+    _equal((await manager.restart())["server"], "one")
     await manager.close()
 
 
-async def test_restart_fails_over_when_the_current_server_refuses(manager, monkeypatch):
+async def test_restart_fails_over_when_the_current_server_refuses(
+    manager: TunnelManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Try the pinned server first and fail over if SSH refuses it."""
     await manager.rotate()
     monkeypatch.setattr(
         asyncio,
@@ -209,37 +273,44 @@ async def test_restart_fails_over_when_the_current_server_refuses(manager, monke
     )
     status = await manager.restart()
     # The pinned server is tried first, then the same failover as rotate().
-    assert status["server"] == "two"
-    assert manager.last_error is None
+    _equal(status["server"], "two")
+    assert manager.last_error is None, "Successful restart failover must clear errors"
     await manager.close()
 
 
-async def test_select_server_connects_to_the_named_server(manager):
+async def test_select_server_connects_to_the_named_server(
+    manager: TunnelManager,
+) -> None:
+    """Select named servers explicitly and pin restart to the selected server."""
     await manager.rotate()
-    assert (await manager.select_server("two"))["server"] == "two"
+    _equal((await manager.select_server("two"))["server"], "two")
     # The selection pins the index, so a restart bounces the chosen server.
-    assert (await manager.restart())["server"] == "two"
-    assert (await manager.select_server("one"))["server"] == "one"
+    _equal((await manager.restart())["server"], "two")
+    _equal((await manager.select_server("one"))["server"], "one")
     await manager.close()
 
 
-async def test_select_server_rejects_an_unknown_name(manager):
+async def test_select_server_rejects_an_unknown_name(manager: TunnelManager) -> None:
+    """Reject unknown names without reserving admission or changing selection."""
     with pytest.raises(ValueError, match="Unknown server: missing"):
         await manager.select_server("missing")
     # A refused selection never reaches the admission gate or the tunnel.
-    assert not manager.busy
+    assert not manager.busy, "Unknown selections must not reserve admission"
     await manager.rotate()
-    assert manager.status()["server"] == "one"
+    _equal(manager.status()["server"], "one")
     await manager.close()
 
 
-async def test_select_server_skips_the_cooldown_but_not_a_running_change(manager):
+async def test_select_server_skips_the_cooldown_but_not_a_running_change(
+    manager: TunnelManager,
+) -> None:
+    """Bypass cooldown for explicit selection without bypassing admission."""
     manager.config.cooldown_seconds = 30
     await manager.rotate()
     with pytest.raises(RotationRejected, match="cooldown"):
         await manager.rotate()
     # An explicit choice is a deliberate request, so the backoff does not apply.
-    assert (await manager.select_server("two"))["server"] == "two"
+    _equal((await manager.select_server("two"))["server"], "two")
     manager._busy = True
     with pytest.raises(RotationRejected, match="in progress"):
         await manager.select_server("one")
@@ -248,32 +319,35 @@ async def test_select_server_skips_the_cooldown_but_not_a_running_change(manager
 
 
 async def test_select_server_reports_a_failure_without_failing_over(
-    manager, monkeypatch
-):
+    manager: TunnelManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leave the tunnel disconnected when an explicitly selected server fails."""
     manager.config.cooldown_seconds = 30
     await manager.rotate()
     monkeypatch.setattr(
         asyncio,
         "create_subprocess_exec",
-        AsyncMock(side_effect=lambda *args, **kwargs: exited_ssh()),
+        AsyncMock(side_effect=lambda *_args, **_kwargs: exited_ssh()),
     )
     with pytest.raises(TunnelFailure, match="SSH exited with code 255"):
         await manager.select_server("two")
     # The named server failed, so the tunnel stays down instead of moving on.
     status = manager.status()
-    assert status["state"] == "disconnected"
-    assert status["server"] is None
-    assert manager.process is None
+    _equal(status["state"], "disconnected")
+    assert status["server"] is None, "Failed selection must clear the active server"
+    assert manager.process is None, "Failed selection must clean up its process"
     await manager.close()
 
 
-async def test_rotate_ignores_the_cooldown_when_asked(manager):
+async def test_rotate_ignores_the_cooldown_when_asked(manager: TunnelManager) -> None:
+    """Allow deliberate rotation to bypass cooldown while respecting admission."""
     manager.config.cooldown_seconds = 30
     await manager.rotate()
     with pytest.raises(RotationRejected, match="cooldown"):
         await manager.rotate()
     # This flag is what the interactive rotate key passes; the API never does.
-    assert (await manager.rotate(ignore_cooldown=True))["server"] == "two"
+    _equal((await manager.rotate(ignore_cooldown=True))["server"], "two")
     # Only the backoff is skipped: a change already running still refuses.
     manager._busy = True
     with pytest.raises(RotationRejected, match="in progress"):
@@ -282,11 +356,11 @@ async def test_rotate_ignores_the_cooldown_when_asked(manager):
     await manager.close()
 
 
-async def test_cancelled_selection_cleans_up(manager):
+async def test_cancelled_selection_cleans_up(manager: TunnelManager) -> None:
     """Cancellation mid-selection must not leave a half-started tunnel."""
     entered = asyncio.Event()
 
-    async def ready():
+    async def ready() -> None:
         entered.set()
         await asyncio.Event().wait()
 
@@ -297,28 +371,36 @@ async def test_cancelled_selection_cleans_up(manager):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert process.terminated
-    assert manager.process is None
+    assert process.terminated, "Cancelled selection must terminate its process"
+    assert manager.process is None, "Cancelled selection must clear its process"
 
 
-async def test_disconnect_stops_the_tunnel_and_clears_the_cooldown(manager):
+async def test_disconnect_stops_the_tunnel_and_clears_the_cooldown(
+    manager: TunnelManager,
+) -> None:
+    """Stop a connection and allow an immediate restart of the same server."""
     manager.config.cooldown_seconds = 30
     await manager.rotate()
     process = manager.process
     disconnected = await manager.disconnect()
-    assert process.terminated
-    assert disconnected["state"] == "disconnected"
-    assert disconnected["connection_id"] is None
+    assert process.terminated, "Disconnect must terminate SSH"
+    _equal(disconnected["state"], "disconnected")
+    assert disconnected["connection_id"] is None, (
+        "Disconnect must clear connection identity"
+    )
     # The cooldown gates connections; stopping never contacts a server, so a
     # restart reconnects to the same server immediately.
-    assert (await manager.restart())["server"] == "one"
+    _equal((await manager.restart())["server"], "one")
     await manager.close()
 
 
-async def test_disconnect_is_rejected_while_a_rotation_runs(manager):
+async def test_disconnect_is_rejected_while_a_rotation_runs(
+    manager: TunnelManager,
+) -> None:
+    """Reject disconnect until an admitted rotation completes."""
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def ready():
+    async def ready() -> bool:
         entered.set()
         await release.wait()
         return True
@@ -330,15 +412,17 @@ async def test_disconnect_is_rejected_while_a_rotation_runs(manager):
         await manager.disconnect()
     release.set()
     await task
-    assert manager.status()["state"] == "connected"
+    _equal(manager.status()["state"], "connected")
     await manager.close()
 
 
-async def test_rotation_is_rejected_while_a_disconnect_stops(manager):
+async def test_rotation_is_rejected_while_a_disconnect_stops(
+    manager: TunnelManager,
+) -> None:
     """The busy flag is held across the stop, so nothing interleaves with it."""
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def slow_stop():
+    async def slow_stop() -> None:
         entered.set()
         await release.wait()
 
@@ -350,33 +434,37 @@ async def test_rotation_is_rejected_while_a_disconnect_stops(manager):
     with pytest.raises(RotationRejected, match="in progress"):
         await manager.restart()
     release.set()
-    assert (await task)["state"] == "disconnected"
-    assert manager.busy is False
+    _equal((await task)["state"], "disconnected")
+    assert manager.busy is False, "Disconnect must release admission"
     await manager.close()
 
 
-async def test_restart_before_any_attempt_uses_the_remembered_server(manager):
+async def test_restart_before_any_attempt_uses_the_remembered_server(
+    manager: TunnelManager,
+) -> None:
+    """Resume the remembered selection when restarting before the first attempt."""
     manager._index = 0  # The state file remembered server "two".
     # Before the first attempt there is no current server to pin, so the
     # restart connects where a rotation would have: the saved server.
-    assert (await manager.restart())["server"] == "two"
+    _equal((await manager.restart())["server"], "two")
     await manager.close()
 
 
-async def test_failure_cleans_process_and_cools_down(manager):
+async def test_failure_cleans_process_and_cools_down(manager: TunnelManager) -> None:
+    """Clean up readiness failures and apply cooldown to the next rotation."""
     manager.config.cooldown_seconds = 30
     manager.config.startup_timeout_seconds = 0.01
     manager._ready = AsyncMock(return_value=False)
     with pytest.raises(TunnelFailure, match="timed out"):
         await manager.rotate()
-    assert manager.process is None
-    assert manager.status()["state"] == "disconnected"
+    assert manager.process is None, "Readiness failure must clean up SSH"
+    _equal(manager.status()["state"], "disconnected")
     with pytest.raises(RotationRejected, match="cooldown"):
         await manager.rotate()
 
 
-def exited_ssh(code=255):
-    """A spawned ssh that failed to connect and exited, as ssh always does."""
+def exited_ssh(code: int = 255) -> Process:
+    """Represent a spawned SSH process that failed to connect and exited."""
     process = Process()
     process.returncode = code
     return process
@@ -417,7 +505,8 @@ async def test_failover_wraps_past_the_end_of_the_list(manager, monkeypatch):
 
 
 async def test_rotation_reports_last_failure_when_every_server_fails(
-    manager, monkeypatch
+    manager,
+    monkeypatch,
 ):
     monkeypatch.setattr(
         asyncio,
@@ -445,7 +534,8 @@ async def test_api_returns_503_when_no_server_accepts_ssh(manager, monkeypatch):
     )
     app = create_app(manager.config, "secret", manager)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         headers = {"Authorization": "Bearer secret"}
         response = await client.post("/rotate", headers=headers)
@@ -478,7 +568,8 @@ async def test_cancelled_rotation_cleans_up(manager):
 async def test_authenticated_api_and_busy_response(manager):
     app = create_app(manager.config, "secret", manager)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         assert (await client.get("/status")).status_code == 401
         headers = {"Authorization": "Bearer secret"}
@@ -494,17 +585,19 @@ async def test_authenticated_api_and_busy_response(manager):
 
 async def test_rotate_with_reason_logs_and_returns_200(manager, caplog):
     """POST /rotate with a reason body should be accepted and logged at INFO."""
-    import logging
 
     caplog.set_level(logging.INFO)
     app = create_app(manager.config, "secret", manager)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         headers = {"Authorization": "Bearer secret"}
         reason = "rule triggered: rate limit exceeded; content: provider.rate-limit: Error: Rate limit exceeded"
         response = await client.post(
-            "/rotate", headers=headers, json={"reason": reason}
+            "/rotate",
+            headers=headers,
+            json={"reason": reason},
         )
         assert response.status_code == 200
         # Verify the reason was logged at INFO level (at least once)
@@ -520,13 +613,12 @@ async def test_rotate_with_reason_logs_and_returns_200(manager, caplog):
 
 async def test_rotate_rejected_before_logging(manager, caplog):
     """When rotation is rejected (busy/cooldown), the reason should NOT be logged."""
-    import logging
     import os
 
     # Skip in CI where coverage instrumentation causes double logging
     if os.environ.get("CI") == "true":
         pytest.skip(
-            "Skipping in CI due to coverage instrumentation double-logging issue"
+            "Skipping in CI due to coverage instrumentation double-logging issue",
         )
 
     # Clear any existing handlers on the tunnel logger to avoid duplicate logs
@@ -538,7 +630,8 @@ async def test_rotate_rejected_before_logging(manager, caplog):
     caplog.set_level(logging.INFO)
     app = create_app(manager.config, "secret", manager)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         headers = {"Authorization": "Bearer secret"}
         # First rotation succeeds
@@ -547,7 +640,9 @@ async def test_rotate_rejected_before_logging(manager, caplog):
         manager._busy = True
         # Second rotation should be rejected and NOT log the reason
         response = await client.post(
-            "/rotate", headers=headers, json={"reason": "should not log"}
+            "/rotate",
+            headers=headers,
+            json={"reason": "should not log"},
         )
         assert response.status_code == 429
         # Verify no INFO log for "should not log"
@@ -598,7 +693,8 @@ def test_config_and_cli(tmp_path):
 
 def test_main_failure_prints_help(monkeypatch, capsys):
     monkeypatch.setattr(
-        "sys.argv", ["tunnel-switch", "validate", "--config", "/missing/config.yaml"]
+        "sys.argv",
+        ["tunnel-switch", "validate", "--config", "/missing/config.yaml"],
     )
     with pytest.raises(SystemExit) as exc:
         main()
@@ -618,8 +714,6 @@ def test_ipv6_command_uses_safe_args():
 
 
 async def test_real_subprocess_rotation(tmp_path, monkeypatch):
-    import socket
-    import sys
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -642,7 +736,9 @@ asyncio.run(main())
 """)
     manager = TunnelManager(config(proxy={"ip": "127.0.0.1", "port": port}))
     monkeypatch.setattr(
-        manager, "command", lambda server: [sys.executable, str(script), str(port)]
+        manager,
+        "command",
+        lambda server: [sys.executable, str(script), str(port)],
     )
     try:
         first = await manager.rotate()
@@ -674,18 +770,21 @@ async def test_lifespan_closes_tunnel(manager):
 
 @pytest.mark.parametrize("token_line", ["", "  token: null\n", '  token: "   "\n'])
 def test_startup_generates_persists_and_prints_token(
-    tmp_path, monkeypatch, capsys, token_line
+    tmp_path,
+    monkeypatch,
+    capsys,
+    token_line,
 ):
-    from tunnel_switch.cli import serve, settings
 
     path = tmp_path / "config.yaml"
     path.write_text(
         "# Keep this comment\nservers:\n  - name: one\n    host: one.example\n    user: tunnel\nproxy:\n  ip: 127.0.0.1\n  port: 1080\napi:\n  port: 8765 # API port\n"
-        + token_line
+        + token_line,
     )
     run = []
     monkeypatch.setattr(
-        "tunnel_switch.cli.uvicorn.run", lambda *args, **kwargs: run.append(kwargs)
+        "tunnel_switch.cli.uvicorn.run",
+        lambda *args, **kwargs: run.append(kwargs),
     )
     serve(path)
     saved = load_config(path).api.token
@@ -704,7 +803,6 @@ def test_startup_generates_persists_and_prints_token(
 
 
 def test_startup_displays_existing_yaml_token(tmp_path, monkeypatch, capsys):
-    from tunnel_switch.cli import serve
 
     path = tmp_path / "config.yaml"
     document = config().model_dump(mode="json")
@@ -718,7 +816,6 @@ def test_startup_displays_existing_yaml_token(tmp_path, monkeypatch, capsys):
 
 
 def test_token_save_failure_prevents_startup(tmp_path, monkeypatch):
-    from tunnel_switch.cli import serve, settings
 
     path = tmp_path / "config.yaml"
     path.write_text(json.dumps(config().model_dump(mode="json")))
@@ -742,7 +839,7 @@ def test_token_save_failure_prevents_startup(tmp_path, monkeypatch):
 def test_host_only_server_loads_and_omits_ssh_overrides(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(
-        "servers:\n  - host: my-ssh-alias\nproxy:\n  ip: 127.0.0.1\n  port: 1080\nstate_file: null\n"
+        "servers:\n  - host: my-ssh-alias\nproxy:\n  ip: 127.0.0.1\n  port: 1080\nstate_file: null\n",
     )
     cfg = load_config(path)
     server = cfg.servers[0]
@@ -765,7 +862,7 @@ def test_ssh_resolves_config_and_explicit_overrides(tmp_path, overrides):
     ssh_config = tmp_path / "ssh_config"
     identity = tmp_path / "identity"
     ssh_config.write_text(
-        f"Host my-ssh-alias\n  HostName 127.0.0.1\n  User config-user\n  Port 2222\n  IdentityFile {identity}\n"
+        f"Host my-ssh-alias\n  HostName 127.0.0.1\n  User config-user\n  Port 2222\n  IdentityFile {identity}\n",
     )
     document = {"host": "my-ssh-alias"}
     if overrides:
@@ -819,7 +916,9 @@ def ready_manager(cfg, monkeypatch):
 
 
 async def test_state_resumes_last_successful_server_after_reordering(
-    manager, tmp_path, monkeypatch
+    manager,
+    tmp_path,
+    monkeypatch,
 ):
     path = tmp_path / "private" / "state.json"
     manager.config.state_file = path
@@ -858,7 +957,9 @@ async def test_failed_rotation_keeps_saved_server(manager, tmp_path):
 
 
 async def test_atomic_state_write_failure_preserves_previous_file(
-    manager, tmp_path, monkeypatch
+    manager,
+    tmp_path,
+    monkeypatch,
 ):
     path = tmp_path / "state.json"
     manager.config.state_file = path
@@ -877,10 +978,14 @@ async def test_atomic_state_write_failure_preserves_previous_file(
 
 
 @pytest.mark.parametrize(
-    "saved", [None, {"version": 1, "server": "removed", "host": "removed.example"}]
+    "saved",
+    [None, {"version": 1, "server": "removed", "host": "removed.example"}],
 )
 async def test_missing_or_removed_state_starts_first_server(
-    manager, tmp_path, monkeypatch, saved
+    manager,
+    tmp_path,
+    monkeypatch,
+    saved,
 ):
     path = tmp_path / "state.json"
     if saved:
@@ -893,7 +998,8 @@ async def test_missing_or_removed_state_starts_first_server(
 
 
 @pytest.mark.parametrize(
-    "contents", ["not JSON", '{"version": 2, "server": "one", "host": "one.example"}']
+    "contents",
+    ["not JSON", '{"version": 2, "server": "one", "host": "one.example"}'],
 )
 def test_invalid_state_fails_without_overwriting(tmp_path, contents):
     path = tmp_path / "state.json"
@@ -935,7 +1041,6 @@ def test_state_paths_and_default_directory(tmp_path):
 
 
 def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
-    from click import unstyle
 
     path = tmp_path / "config.yaml"
     path.write_text(json.dumps(config().model_dump(mode="json")))
@@ -965,7 +1070,8 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
     captured.clear()
     assert (
         runner.invoke(
-            app, ["serve", "--config", str(path), "--server-name", "missing"]
+            app,
+            ["serve", "--config", str(path), "--server-name", "missing"],
         ).exit_code
         != 0
     )
@@ -978,7 +1084,6 @@ def test_state_cli_options_and_invalid_name(tmp_path, monkeypatch):
 
 
 def test_version_flag_reports_the_package_version():
-    import tunnel_switch
 
     result = CliRunner().invoke(app, ["--version"])
     assert result.exit_code == 0, result.output
@@ -986,7 +1091,6 @@ def test_version_flag_reports_the_package_version():
 
 
 def test_startup_echo_reports_the_version(capsys):
-    from tunnel_switch import __version__
     from tunnel_switch.cli import _echo_startup
 
     _echo_startup(config(), "token", None)
@@ -1002,7 +1106,8 @@ async def test_status_endpoint_reports_the_proxy_request_counter(manager):
     application.state.http_proxy.counter.record()
     headers = {"Authorization": "Bearer secret"}
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application), base_url="http://test"
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
     ) as client:
         payload = (await client.get("/status", headers=headers)).json()
     assert payload["requests"] == {"current": 1, "last": 0}
@@ -1038,12 +1143,12 @@ def test_create_app_gives_a_supplied_counter_to_the_manager_it_builds():
 
 
 async def test_status_reports_the_package_version(manager):
-    import tunnel_switch
 
     application = create_app(manager.config, "secret", manager)
     headers = {"Authorization": "Bearer secret"}
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application), base_url="http://test"
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
     ) as client:
         payload = (await client.get("/status", headers=headers)).json()
     assert payload["version"] == tunnel_switch.__version__
@@ -1051,7 +1156,6 @@ async def test_status_reports_the_package_version(manager):
 
 
 def test_package_version_falls_back_without_metadata(monkeypatch):
-    from importlib.metadata import PackageNotFoundError
 
     import tunnel_switch
 
@@ -1066,14 +1170,13 @@ def test_package_version_falls_back_without_metadata(monkeypatch):
 
 def test_reported_version_matches_pyproject():
     """A stale editable install reports an old build: refresh it if this fails."""
-    import tomllib
 
     import tunnel_switch
 
     if tunnel_switch.__version__ == "0+unknown":
         pytest.skip("no distribution metadata (bare source tree)")
     declared = tomllib.loads(
-        (Path(__file__).parent.parent / "pyproject.toml").read_text()
+        (Path(__file__).parent.parent / "pyproject.toml").read_text(),
     )["project"]["version"]
     assert tunnel_switch.__version__ == declared, (
         "installed metadata is stale; refresh with `uv pip install -e .`"
@@ -1081,10 +1184,11 @@ def test_reported_version_matches_pyproject():
 
 
 async def test_cancelled_state_save_finishes_before_next_rotation(
-    manager, tmp_path, monkeypatch
+    manager,
+    tmp_path,
+    monkeypatch,
 ):
     import threading
-    from tunnel_switch.state import save_last_server
 
     entered, release = threading.Event(), threading.Event()
     path = tmp_path / "state.json"
@@ -1119,7 +1223,6 @@ async def test_cancelled_state_save_finishes_before_next_rotation(
 
 def test_cli_config_discovery(tmp_path, monkeypatch):
     from pathlib import Path
-    from tunnel_switch.cli import resolve_config
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
@@ -1145,7 +1248,7 @@ def test_cli_config_discovery(tmp_path, monkeypatch):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync")
 def test_state_syncs_directory_after_replace(tmp_path, monkeypatch):
     import os
-    import stat
+
     from tunnel_switch.state import save_last_server
 
     events = []
@@ -1168,7 +1271,7 @@ def test_state_syncs_directory_after_replace(tmp_path, monkeypatch):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync")
 def test_state_directory_sync_failure_closes_handle(tmp_path, monkeypatch):
     import os
-    import stat
+
     from tunnel_switch.state import save_last_server
 
     fsync = os.fsync
@@ -1192,10 +1295,10 @@ def test_state_directory_sync_failure_closes_handle(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync")
 async def test_failed_directory_sync_restores_saved_selection(
-    manager, tmp_path, monkeypatch
+    manager,
+    tmp_path,
+    monkeypatch,
 ):
-    import stat
-    from tunnel_switch.state import load_last_server
 
     path = tmp_path / "state.json"
     manager.config.state_file = path
@@ -1233,9 +1336,9 @@ def test_init_config_is_private_and_does_not_overwrite(tmp_path):
 
 @pytest.mark.parametrize("timeout_stage", ["connect", "read"])
 async def test_readiness_retries_after_transient_probe_timeout(
-    monkeypatch, timeout_stage
+    monkeypatch,
+    timeout_stage,
 ):
-    from unittest.mock import Mock
 
     manager = TunnelManager(config(startup_timeout_seconds=2))
     manager.process = Process()
@@ -1243,7 +1346,7 @@ async def test_readiness_retries_after_transient_probe_timeout(
     reader.readexactly = AsyncMock(
         side_effect=[TimeoutError(), b"\x05\x00"]
         if timeout_stage == "read"
-        else [b"\x05\x00"]
+        else [b"\x05\x00"],
     )
     writer = Mock()
     writer.drain = AsyncMock()
@@ -1316,7 +1419,9 @@ async def test_auto_reconnect_fails_over_and_applies_pending_bind(manager, monke
 
 
 async def test_auto_reconnect_backoff_is_capped_and_survives_outage(
-    manager, monkeypatch, caplog
+    manager,
+    monkeypatch,
+    caplog,
 ):
     await manager.rotate()
     spawn = AsyncMock(side_effect=[exited_ssh() for _ in range(8)] + [Process()])
@@ -1336,8 +1441,114 @@ async def test_auto_reconnect_backoff_is_capped_and_survives_outage(
         await manager.close()
 
 
+async def test_reload_lower_delay_cap_preserves_deadline_then_caps_next_retry(
+    manager,
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    """Keep a scheduled wait but apply a reloaded cap to the following wait."""
+    await manager.rotate()
+    manager.config.logging.file = None
+    manager.config.reconnect_delay_seconds = 1
+    manager.config.reconnect_max_delay_seconds = 4
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(manager.config.model_dump(mode="json")))
+    application = create_app(manager.config, "secret", manager, config_path=path)
+    attempts = []
+    clock = [0.0]
+    monkeypatch.setattr(
+        "tunnel_switch.tunnel.time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+
+    async def fail(_pre_connect):
+        attempts.append(clock[0])
+        raise TunnelFailure("Temporary network outage")
+
+    monkeypatch.setattr(manager, "_recover", fail)
+    manager.start_monitor(interval=0.005)
+    manager.process.returncode = 255
+    try:
+        await wait_for_condition(lambda: len(attempts) == 1)
+        desired = manager.config.model_dump(mode="json")
+        desired.update(reconnect_delay_seconds=0.02, reconnect_max_delay_seconds=0.02)
+        path.write_text(json.dumps(desired))
+        outcome = await application.state.reloader.reload_now()
+        assert outcome.applied
+        await asyncio.sleep(0.03)
+        assert len(attempts) == 1
+        clock[0] = 1
+        await wait_for_condition(lambda: len(attempts) >= 2)
+        retries = [
+            record.args[0]
+            for record in caplog.records
+            if record.msg.startswith("Tunnel reconnection failed")
+        ]
+        assert retries[0] == 1
+        assert retries[1] == 0.02
+        assert attempts[1] - attempts[0] == 1
+        clock[0] = 1.01
+        await asyncio.sleep(0.03)
+        assert len(attempts) == 2
+        clock[0] = 1.03
+        await wait_for_condition(lambda: len(attempts) == 3)
+    finally:
+        await manager.close()
+
+
+async def test_proxy_admission_is_disabled_before_pending_bind_is_published(
+    manager,
+    monkeypatch,
+    tmp_path,
+):
+    """Do not admit traffic on a new bind while the old SSH process stops."""
+    await manager.rotate()
+    manager.config.logging.file = None
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(manager.config.model_dump(mode="json")))
+    application = create_app(manager.config, "secret", manager, config_path=path)
+    desired = manager.config.model_dump(mode="json")
+    desired["proxy"]["port"] = 1081
+    path.write_text(json.dumps(desired))
+    await application.state.reloader.reload_now()
+    entered, release = asyncio.Event(), asyncio.Event()
+    stop = manager._stop
+
+    async def slow_stop():
+        entered.set()
+        await release.wait()
+        await stop()
+
+    monkeypatch.setattr(manager, "_stop", slow_stop)
+    open_connection = AsyncMock()
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    task = asyncio.create_task(
+        manager.rotate(application.state.reloader.apply_pending_binds)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert manager.process.returncode is None
+        assert application.state.http_proxy.config.proxy.port == 1081
+        assert not manager.adopted()
+        assert manager.connection_id() is None
+        with pytest.raises(ProxyError, match="Managed tunnel unavailable"):
+            await application.state.http_proxy._socks("example.test", 80)
+        open_connection.assert_not_awaited()
+        release.set()
+        await task
+        assert manager.adopted()
+    finally:
+        release.set()
+        try:
+            await task
+        finally:
+            await manager.close()
+
+
 async def test_auto_reconnect_respects_disconnect_and_manual_reconnect(
-    manager, monkeypatch
+    manager,
+    monkeypatch,
 ):
     await manager.rotate()
     monkeypatch.setattr(
@@ -1387,6 +1598,52 @@ async def test_auto_reconnect_can_be_disabled_and_reenabled_live(manager):
         await manager.close()
 
 
+async def test_monitor_reports_ssh_exit_once_when_recovery_disabled(manager, caplog):
+    await manager.rotate()
+    manager.config.reconnect_attempts = 0
+    start_recovery(manager)
+    try:
+        dead = manager.process
+        dead.returncode = 255
+        await wait_for_condition(lambda: manager.last_error is not None)
+        await asyncio.sleep(0.08)
+        assert manager.process is dead
+        assert manager.last_error == "SSH tunnel exited with code 255"
+        exits = [
+            record
+            for record in caplog.records
+            if record.getMessage() == manager.last_error
+        ]
+        assert len(exits) == 1
+        assert not any(
+            "reconnecting" in record.getMessage() for record in caplog.records
+        )
+        assert not manager.busy
+    finally:
+        await manager.close()
+
+
+async def test_failed_selection_allows_subsequent_auto_recovery_failover(
+    manager,
+    monkeypatch,
+):
+    spawn = AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process()])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    # The selection itself must fail without trying server one.
+    with pytest.raises(TunnelFailure):
+        await manager.select_server("two")
+    assert spawn.await_count == 1
+    start_recovery(manager)
+    try:
+        await wait_for_condition(manager.adopted)
+        assert manager.status()["server"] == "one"
+        assert spawn.await_count == 3
+        assert spawn.call_args_list[1].args[-1] == "two.example"
+        assert spawn.call_args_list[2].args[-1] == "one.example"
+    finally:
+        await manager.close()
+
+
 async def test_auto_reconnect_resolves_server_identity_after_reload(manager):
     await manager.rotate()
     manager.config = manager.config.model_copy(deep=True)
@@ -1401,7 +1658,8 @@ async def test_auto_reconnect_resolves_server_identity_after_reload(manager):
 
 
 async def test_manual_selection_supersedes_a_pending_auto_reconnect(
-    manager, monkeypatch
+    manager,
+    monkeypatch,
 ):
     await manager.rotate()
     monkeypatch.setattr(
@@ -1443,7 +1701,10 @@ async def test_auto_reconnect_attempts_immediately_before_backoff(manager):
 
 @pytest.mark.parametrize("budget", [0, 1, 5])
 async def test_auto_reconnect_limits_attempts_per_outage(
-    manager, monkeypatch, caplog, budget
+    manager,
+    monkeypatch,
+    caplog,
+    budget,
 ):
     await manager.rotate()
     manager.config.reconnect_attempts = budget
@@ -1454,7 +1715,7 @@ async def test_auto_reconnect_limits_attempts_per_outage(
     try:
         if budget:
             await wait_for_condition(
-                lambda: spawn.await_count == budget * 2 and not manager.busy
+                lambda: spawn.await_count == budget * 2 and not manager.busy,
             )
         await asyncio.sleep(0.15)
         assert spawn.await_count == budget * 2
@@ -1485,7 +1746,8 @@ async def test_manual_connection_resets_exhausted_recovery_budget(manager, monke
 
 
 async def test_live_retry_budget_increase_resumes_exhausted_recovery(
-    manager, monkeypatch
+    manager,
+    monkeypatch,
 ):
     await manager.rotate()
     manager.config.reconnect_attempts = 1
@@ -1551,6 +1813,51 @@ async def test_close_cancels_an_in_progress_auto_reconnect(manager):
     assert not manager.busy
 
 
+async def test_close_propagates_caller_cancellation_after_cleanup(manager):
+    await manager.rotate()
+    process = manager.process
+    started, cancelling = asyncio.Event(), asyncio.Event()
+
+    async def monitor():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelling.set()
+            await asyncio.Event().wait()
+
+    manager._monitor_task = asyncio.create_task(monitor())
+    await started.wait()
+    close = asyncio.create_task(manager.close())
+    try:
+        await asyncio.wait_for(cancelling.wait(), 2)
+        close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+        assert process.terminated
+        assert manager.process is None
+        assert manager._monitor_task is None
+    finally:
+        if not close.done():
+            close.cancel()
+            await asyncio.gather(close, return_exceptions=True)
+
+
+async def test_close_reports_unexpected_monitor_failure_after_cleanup(manager):
+    await manager.rotate()
+    process = manager.process
+
+    async def failed_monitor():
+        raise RuntimeError("Monitor failed")
+
+    manager._monitor_task = asyncio.create_task(failed_monitor())
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="Monitor failed"):
+        await manager.close()
+    assert process.terminated
+    assert manager.process is None
+
+
 async def test_lifespan_keeps_api_up_after_initial_tunnel_failure(manager, monkeypatch):
     manager.config.start_on_launch = True
     spawn = AsyncMock(side_effect=[exited_ssh(), exited_ssh(), Process()])
@@ -1560,10 +1867,12 @@ async def test_lifespan_keeps_api_up_after_initial_tunnel_failure(manager, monke
     async with application.router.lifespan_context(application):
         assert manager.status()["state"] == "disconnected"
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=application), base_url="http://test"
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://test",
         ) as client:
             response = await client.get(
-                "/status", headers={"Authorization": "Bearer secret"}
+                "/status",
+                headers={"Authorization": "Bearer secret"},
             )
             assert response.status_code == 200
         await wait_for_condition(manager.adopted)
@@ -1572,7 +1881,8 @@ async def test_lifespan_keeps_api_up_after_initial_tunnel_failure(manager, monke
 
 
 async def test_lifespan_still_fails_startup_when_recovery_disabled(
-    manager, monkeypatch
+    manager,
+    monkeypatch,
 ):
     manager.config.start_on_launch = True
     manager.config.reconnect_attempts = 0
@@ -1582,9 +1892,9 @@ async def test_lifespan_still_fails_startup_when_recovery_disabled(
         AsyncMock(side_effect=[exited_ssh(), exited_ssh()]),
     )
     application = create_app(manager.config, "secret", manager)
+    lifespan = application.router.lifespan_context(application)
     with pytest.raises(TunnelFailure):
-        async with application.router.lifespan_context(application):
-            pytest.fail("Startup should have failed")
+        await lifespan.__aenter__()
     assert manager.process is None
 
 
