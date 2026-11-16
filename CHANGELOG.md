@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+## 1.5.1 — 2026-11-16
+
 - Automatically reconnect failed SSH tunnels immediately on detection, trying the current server before failover with configurable exponential backoff after failures. Default to 5 recovery attempts per outage; `reconnect_attempts: 0` disables recovery. Keep the API available during startup outages; respect intentional disconnects and cancel recovery on shutdown.
+- Prevent proxy forwarding through unrelated or stale SOCKS listeners during tunnel recovery and rotation.
+- Ignore non-string optional API rotation reasons, bound tunnel shutdown when state persistence stalls, and avoid duplicate configuration reload failure logs.
+- Update dependencies, including the security fix in `opentelemetry-api` 1.45.2.
 
 ## 1.5.0 — 2026-11-02
 
