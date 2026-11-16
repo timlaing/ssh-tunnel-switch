@@ -10,11 +10,15 @@ is next recreated.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
+from dataclasses import KW_ONLY, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Protocol
 
-from .config import Config, load_config
+from yaml import YAMLError
+
+from .config import API, Config, HTTPProxy, Proxy, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +26,13 @@ POLL_SECONDS = 2.0
 DEBOUNCE_SECONDS = 0.2
 
 
-def _endpoint(listener) -> str:
+class ConfigTarget(Protocol):
+    """Describe a reload participant with a replaceable configuration."""
+
+    config: Config
+
+
+def _endpoint(listener: API | HTTPProxy | Proxy) -> str:
     address = str(listener.ip)
     host = f"[{address}]" if ":" in address else address
     return f"{host}:{listener.port}"
@@ -41,13 +51,13 @@ def merge_binds(current: Config, desired: Config) -> tuple[Config, list[str]]:
     if merged.proxy != current.proxy:
         deferred.append(
             f"proxy bind {_endpoint(current.proxy)} -> {_endpoint(merged.proxy)}"
-            " applies on the next rotation"
+            " applies on the next rotation",
         )
         merged.proxy = current.proxy
     if (merged.api.ip, merged.api.port) != (current.api.ip, current.api.port):
         deferred.append(
             f"API bind {_endpoint(current.api)} -> {_endpoint(merged.api)}"
-            " requires a service restart"
+            " requires a service restart",
         )
         merged.api.ip, merged.api.port = current.api.ip, current.api.port
     if (merged.http_proxy.enabled, merged.http_proxy.ip, merged.http_proxy.port) != (
@@ -57,7 +67,7 @@ def merge_binds(current: Config, desired: Config) -> tuple[Config, list[str]]:
     ):
         deferred.append(
             f"HTTP proxy bind {_endpoint(current.http_proxy)}"
-            f" -> {_endpoint(merged.http_proxy)} requires a service restart"
+            f" -> {_endpoint(merged.http_proxy)} requires a service restart",
         )
         merged.http_proxy.enabled = current.http_proxy.enabled
         merged.http_proxy.ip, merged.http_proxy.port = (
@@ -67,27 +77,23 @@ def merge_binds(current: Config, desired: Config) -> tuple[Config, list[str]]:
     return merged, deferred
 
 
+@dataclass(eq=False, repr=False, kw_only=True)
 class ReloadOutcome:
     """One reload attempt, reported to callers, the log and the status panel."""
 
-    def __init__(
-        self,
-        *,
-        applied: bool = False,
-        unchanged: bool = False,
-        refused: bool = False,
-        error: str | None = None,
-        deferred: Sequence[str] = (),
-        config: Config | None = None,
-    ):
-        self.applied = applied
-        self.unchanged = unchanged
-        self.refused = refused
-        self.error = error
-        self.deferred = tuple(deferred)
-        self.config = config
+    applied: bool = False
+    unchanged: bool = False
+    refused: bool = False
+    error: str | None = None
+    deferred: Sequence[str] = ()
+    config: Config | None = None
+
+    def __post_init__(self) -> None:
+        """Snapshot deferred changes so callers cannot mutate the outcome."""
+        self.deferred = tuple(self.deferred)
 
     def summary(self) -> str:
+        """Summarize the result for logs and the operator's status panel."""
         if self.refused:
             return f"refused: {self.error}" if self.error else "refused"
         if self.error is not None:
@@ -98,8 +104,8 @@ class ReloadOutcome:
         servers = len(self.config.servers) if self.config is not None else 0
         return f"applied ({servers} servers){note}"
 
-    def payload(self) -> dict:
-        """The JSON shape returned by ``POST /reload``."""
+    def payload(self) -> dict[str, bool | str | list[str] | int | None]:
+        """Return the JSON response for ``POST /reload``."""
         return {
             "applied": self.applied,
             "unchanged": self.unchanged,
@@ -110,6 +116,7 @@ class ReloadOutcome:
         }
 
 
+@dataclass(eq=False, repr=False)
 class ConfigReloader:
     """Apply configuration changes, either on a timer or on demand.
 
@@ -122,26 +129,21 @@ class ConfigReloader:
     server list.
     """
 
-    def __init__(
-        self,
-        path: Path,
-        config: Config,
-        *,
-        targets: Sequence = (),
-        hooks: Sequence[Callable[[ReloadOutcome], None]] = (),
-        prepare: Callable[[Config], None] | None = None,
-        busy: Callable[[], bool] | None = None,
-        interval: float = POLL_SECONDS,
-    ):
-        self.path = path
-        self.config = config
-        self.targets = list(targets)
-        self.hooks = tuple(hooks)
-        self.prepare = prepare
-        self.busy = busy
-        self.interval = interval
-        self.last_reload = None
-        self.last_error = None
+    path: Path
+    config: Config
+    _: KW_ONLY
+    targets: Sequence[ConfigTarget] = ()
+    hooks: Sequence[Callable[[ReloadOutcome], None]] = ()
+    prepare: Callable[[Config], None] | None = None
+    busy: Callable[[], bool] | None = None
+    interval: float = POLL_SECONDS
+
+    def __post_init__(self) -> None:
+        """Snapshot collaborators and initialize serialized reload tracking."""
+        self.targets = list(self.targets)
+        self.hooks = tuple(self.hooks)
+        self.last_reload: str | None = None
+        self.last_error: str | None = None
         self.deferred: list[str] = []
         self.pending: Config | None = None
         # The poller, POST /reload, SIGHUP and the status-panel key all call
@@ -158,7 +160,7 @@ class ConfigReloader:
             return None
         return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
-    async def run(self, stop: asyncio.Event):
+    async def run(self, stop: asyncio.Event) -> None:
         """Poll the file and reload on a change until ``stop`` is set."""
         while not stop.is_set():
             try:
@@ -196,13 +198,20 @@ class ConfigReloader:
         try:
             desired = await asyncio.to_thread(load_config, self.path)
         except Exception as exc:
+            # Reload is a recovery boundary: even unexpected loader failures
+            # must retain the last working configuration and reach the panel.
+            if isinstance(exc, (ValueError, OSError, YAMLError)):
+                logger.warning(
+                    "Configuration reload failed; keeping the running configuration: %s",
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "Unexpected configuration reload failure; keeping the running configuration",
+                )
             self.last_error = str(exc)
             self.last_reload = f"{self._stamp()} failed: {exc}"
             outcome = ReloadOutcome(error=str(exc), config=self.config)
-            logger.warning(
-                "Configuration reload failed; keeping the running configuration: %s",
-                exc,
-            )
             self._notify(outcome)
             return outcome
         if self.busy is not None and self.busy():
@@ -261,10 +270,12 @@ class ConfigReloader:
         return adopted
 
     def _refused(self) -> ReloadOutcome:
-        """A rotation owns the loop: the reload keeps its old signature and retries."""
+        """Refuse a reload while rotation owns the loop, allowing a later retry."""
         logger.debug("Configuration reload deferred: a rotation is in progress")
         return ReloadOutcome(
-            refused=True, error="rotation in progress", config=self.config
+            refused=True,
+            error="rotation in progress",
+            config=self.config,
         )
 
     def _notify(self, outcome: ReloadOutcome) -> None:
@@ -273,4 +284,4 @@ class ConfigReloader:
 
     @staticmethod
     def _stamp() -> str:
-        return datetime.now(timezone.utc).strftime("%H:%M:%S")
+        return datetime.now(UTC).strftime("%H:%M:%S")

@@ -19,24 +19,42 @@ the highlighted server to the select action and Esc closes the picker
 without changing anything.
 """
 
-from datetime import datetime, timezone
+from __future__ import annotations
+
 import logging
 import os
 import select
+import sys
+from contextlib import suppress
+from datetime import UTC, datetime
 from threading import Event
+from typing import TYPE_CHECKING
 
-from rich.console import Console, Group, Segment
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
 from rich.panel import Panel
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
+if os.name == "posix":
+    import termios
+    import tty
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+    from ipaddress import IPv4Address, IPv6Address
+
+    from .config import Config
+    from .tunnel import TunnelManager
+
 from . import __version__
-from .config import Config
 
 logger = logging.getLogger(__name__)
 
 REFRESH_SECONDS = 0.5
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
 ESCAPE_WAIT_SECONDS = 0.05
 STATE_STYLES = {"connected": "green", "rotating": "yellow", "disconnected": "red"}
 KEYS = {
@@ -79,17 +97,18 @@ def decode_key(sequence: bytes) -> str | None:
 class PanelState:
     """Feedback text shared between the key handler and the display thread."""
 
-    def __init__(self):
-        self.last_reload = None
-        self.last_action = None
+    def __init__(self) -> None:
+        """Initialize empty feedback and a closed, unscrolled server picker."""
+        self.last_reload: str | None = None
+        self.last_action: str | None = None
         # Highlighted row of the open server picker; None while it is closed.
-        self.picker_index = None
+        self.picker_index: int | None = None
         # First server shown by the picker's scroll window, moved by rendering
         # so the highlight stays visible within the display.
         self.picker_offset = 0
 
 
-def _endpoint(ip, port: int) -> str:
+def _endpoint(ip: str | IPv4Address | IPv6Address, port: int) -> str:
     address = str(ip)
     host = f"[{address}]" if ":" in address else address
     return f"{host}:{port}"
@@ -99,12 +118,15 @@ def _elapsed(started_at: str | None) -> str:
     if not started_at:
         return ""
     since = datetime.fromisoformat(started_at)
-    seconds = int((datetime.now(timezone.utc) - since).total_seconds())
-    if seconds < 60:
+    seconds = int((datetime.now(UTC) - since).total_seconds())
+    if seconds < SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60}s"
-    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds < SECONDS_PER_HOUR:
+        return f"{seconds // SECONDS_PER_MINUTE}m {seconds % SECONDS_PER_MINUTE}s"
+    return (
+        f"{seconds // SECONDS_PER_HOUR}h "
+        f"{(seconds % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE}m"
+    )
 
 
 class _Overlay:
@@ -124,13 +146,23 @@ class _Overlay:
     fit is dropped rather than pushed below the display.
     """
 
-    def __init__(self, base, popup, offset: int = 0, limit: int | None = None):
+    def __init__(
+        self,
+        base: RenderableType,
+        popup: RenderableType,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> None:
         self.base = base
         self.popup = popup
         self.offset = offset
         self.limit = limit
 
-    def __rich_console__(self, console, options):
+    def __rich_console__(
+        self,
+        console: Console,
+        options: ConsoleOptions,
+    ) -> RenderResult:
         lines = list(Segment.split_lines(console.render(self.base, options)))
         popup = list(Segment.split_lines(console.render(self.popup, options)))
         for index, line in enumerate(popup):
@@ -189,9 +221,12 @@ def _picker_window(state: PanelState, total: int, rows: int | None) -> tuple[int
 
 
 def _server_picker(
-    config: Config, status: dict, state: PanelState, rows: int | None = None
+    config: Config,
+    status: dict,
+    state: PanelState,
+    rows: int | None = None,
 ) -> Panel:
-    """The picker as a pop-up: the servers in the window that fits the display.
+    """Render the servers in a pop-up window that fits the display.
 
     The window follows the highlight, and the title names how many servers
     are hidden above and below it, so a scrolled-away part of the list is
@@ -214,20 +249,20 @@ def _server_picker(
         server = servers[index]
         picked = index == state.picker_index
         host = "" if server.host == server.name else f" ({server.host})"
-        marker = "❯ " if picked else "  "
+        marker = "\u276f " if picked else "  "
         note = " · current" if server.name == current else ""
         lines.append(
             Text(
                 f"{marker}{server.name}{host}{note}",
                 style="bold" if picked else "dim",
-            )
+            ),
         )
     lines.extend(Text(line, style="dim") for line in PICKER_FOOTER)
     return Panel(Group(*lines), title=title, border_style="cyan")
 
 
 def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
-    """The fixed rows: tunnel identity, listeners and the log file."""
+    """Build the fixed rows: tunnel identity, listeners and the log file."""
     state_name = status["state"]
     connection = (status["connection_id"] or "")[:8]
     started = status["started_at"] or "-"
@@ -247,14 +282,14 @@ def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
             (
                 "HTTP requests",
                 f"{requests['current']} current · [dim]{requests['last']} last[/dim]",
-            )
+            ),
         )
     rows.append(
-        ("SOCKS proxy", _endpoint(status["proxy"]["ip"], status["proxy"]["port"]))
+        ("SOCKS proxy", _endpoint(status["proxy"]["ip"], status["proxy"]["port"])),
     )
     if config.http_proxy.enabled:
         rows.append(
-            ("HTTP proxy", _endpoint(config.http_proxy.ip, config.http_proxy.port))
+            ("HTTP proxy", _endpoint(config.http_proxy.ip, config.http_proxy.port)),
         )
     rows.extend(
         [
@@ -263,13 +298,13 @@ def _summary_rows(config: Config, status: dict) -> list[tuple[str, str]]:
                 "Log file",
                 str(config.logging.file) if config.logging.file else "disabled",
             ),
-        ]
+        ],
     )
     return rows
 
 
 def _feedback_rows(status: dict, state: PanelState | None) -> list[tuple[str, str]]:
-    """The rows that only appear once something has happened."""
+    """Build the rows that only appear once something has happened."""
     rows = []
     if state is not None and state.last_reload:
         rows.append(("Last reload", state.last_reload))
@@ -280,8 +315,8 @@ def _feedback_rows(status: dict, state: PanelState | None) -> list[tuple[str, st
     return rows
 
 
-def _footer(state: PanelState | None, keys: bool) -> list:
-    """The key footer, hidden while the open picker owns the keyboard."""
+def _footer(state: PanelState | None, *, keys: bool) -> list[Text]:
+    """Build the key footer, hiding it while the picker owns the keyboard."""
     if not keys or (state is not None and state.picker_index is not None):
         return []
     return [Text(line, style="dim") for line in FOOTER]
@@ -305,21 +340,22 @@ def status_panel(
     """
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold cyan", justify="left")
-    table.add_column(justify="left")
+    table.add_column(justify="left", overflow="fold")
     for label, value in (
         *_summary_rows(config, status),
         *_feedback_rows(status, state),
     ):
         table.add_row(label, value)
     panel = Panel(
-        Group(table, *_footer(state, keys)),
+        Group(table, *_footer(state, keys=keys)),
         title=f"SSH Tunnel Switch {__version__}",
         border_style="blue",
     )
     if not keys or state is None or state.picker_index is None:
         return panel
     rows = _picker_rows(
-        height, PICKER_OFFSET_LINES + PICKER_EDGE_LINES + len(PICKER_FOOTER)
+        height,
+        PICKER_OFFSET_LINES + PICKER_EDGE_LINES + len(PICKER_FOOTER),
     )
     # The composition may use every row of the display and no more, so
     # wrapped or over-budget content is cut at the last line, not below it.
@@ -347,15 +383,13 @@ def _disable_flow_control(descriptor: int) -> None:
     Ctrl+S that only pauses the output is otherwise indistinguishable from one
     the panel never received.
     """
-    import termios
-
     mask = 0
     for flag in ("IXON", "IXANY", "IXOFF"):
         mask |= getattr(termios, flag, 0)
     if not mask:
         logger.warning(
             "This build of termios has no software flow-control flags; Ctrl+S "
-            "pauses the output instead of opening the server picker."
+            "pauses the output instead of opening the server picker.",
         )
         return
     try:
@@ -370,7 +404,7 @@ def _disable_flow_control(descriptor: int) -> None:
         )
 
 
-def _key_reader():
+def _key_reader() -> tuple[int | None, Callable[[], None]]:
     """Put stdin in cbreak mode, returning its descriptor and a restore call.
 
     cbreak disables echo and line buffering so single keys are readable, while
@@ -381,10 +415,6 @@ def _key_reader():
     """
     if os.name != "posix":
         return None, lambda: None
-    import sys
-    import termios
-    import tty
-
     stream = sys.stdin
     try:
         if not stream.isatty():
@@ -397,16 +427,19 @@ def _key_reader():
 
     _disable_flow_control(descriptor)
 
-    def restore():
-        try:
+    def restore() -> None:
+        with suppress(OSError, termios.error):
             termios.tcsetattr(descriptor, termios.TCSADRAIN, saved)
-        except (OSError, termios.error):
-            pass
 
     return descriptor, restore
 
 
-def _dispatch(run, state: PanelState, action: str, *args) -> None:
+def _dispatch(
+    run: Callable[..., object],
+    state: PanelState,
+    action: str,
+    *args: str,
+) -> None:
     """Run one key action, reporting a failed dispatch in the panel."""
     try:
         run(*args)
@@ -414,7 +447,7 @@ def _dispatch(run, state: PanelState, action: str, *args) -> None:
         state.last_action = f"{action}: {exc}"
 
 
-def _open_picker(state: PanelState, manager) -> None:
+def _open_picker(state: PanelState, manager: TunnelManager) -> None:
     """Highlight the server the tunnel uses, or the one a rotation would pick."""
     current = manager.status()["server"]
     state.picker_index = next(
@@ -434,7 +467,12 @@ def _close_picker(state: PanelState) -> None:
     state.picker_offset = 0
 
 
-def _handle_picker(sequence: bytes, actions, state: PanelState, manager) -> None:
+def _handle_picker(
+    sequence: bytes,
+    actions: Mapping[str, Callable[..., object]] | None,
+    state: PanelState,
+    manager: TunnelManager | None,
+) -> None:
     """Move the highlight, or hand the chosen server to the select action."""
     servers = manager.config.servers if manager is not None else []
     step = PICKER_KEYS.get(sequence)
@@ -452,7 +490,12 @@ def _handle_picker(sequence: bytes, actions, state: PanelState, manager) -> None
         _close_picker(state)
 
 
-def _handle_keys(descriptor: int, actions, state: PanelState, manager=None) -> None:
+def _handle_keys(
+    descriptor: int,
+    actions: Mapping[str, Callable[..., object]] | None,
+    state: PanelState,
+    manager: TunnelManager | None = None,
+) -> None:
     sequence = os.read(descriptor, 32)
     # Alt+R may arrive as ESC and "r" in separate reads.
     if (
@@ -476,12 +519,12 @@ def _handle_keys(descriptor: int, actions, state: PanelState, manager=None) -> N
 
 
 def run_status_display(
-    manager,
+    manager: TunnelManager,
     stop: Event,
     console: Console | None = None,
-    actions=None,
+    actions: Mapping[str, Callable[..., object]] | None = None,
     state: PanelState | None = None,
-):
+) -> None:
     """Refresh the status panel, and handle keys, until ``stop`` is set.
 
     Runs inside a daemon thread so the main thread keeps uvicorn's normal
@@ -493,7 +536,7 @@ def run_status_display(
     descriptor, restore = _key_reader()
     keys = descriptor is not None and actions is not None
 
-    def panel():
+    def panel() -> Panel | _Overlay:
         # The display's height, not the window's, caps the open picker: the
         # panel is what the terminal shows, so the list scrolls inside it.
         return status_panel(
@@ -514,7 +557,10 @@ def run_status_display(
             while True:
                 if descriptor is not None:
                     readable, _, _ = select.select(
-                        [descriptor], [], [], REFRESH_SECONDS
+                        [descriptor],
+                        [],
+                        [],
+                        REFRESH_SECONDS,
                     )
                 else:
                     readable = []

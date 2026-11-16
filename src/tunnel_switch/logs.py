@@ -4,6 +4,8 @@ import logging
 import os
 import time
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import TextIO, override
 
 from .config import Logging
 
@@ -23,11 +25,13 @@ class UTCFormatter(logging.Formatter):
 class PrivateFileHandler(RotatingFileHandler):
     """Create the log privately (mode 0600), including after rollover."""
 
-    def _open(self):
-        directory = os.path.dirname(self.baseFilename)
-        if directory:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-            _check_directory_privacy(directory)
+    _tunnel_switch = True
+
+    @override
+    def _open(self) -> TextIO:
+        directory = Path(self.baseFilename).parent
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _check_directory_privacy(directory)
         # O_NOFOLLOW refuses a symlink swapped in for the log file itself after
         # configuration time, so appends cannot be redirected onto the YAML or
         # identity files, and the mode is applied to the descriptor so it
@@ -40,30 +44,40 @@ class PrivateFileHandler(RotatingFileHandler):
         try:
             os.fchmod(descriptor, FILE_MODE)
             return os.fdopen(
-                descriptor, self.mode, encoding=self.encoding, errors="replace"
+                descriptor,
+                self.mode,
+                encoding=self.encoding,
+                errors="replace",
             )
         except OSError:
             os.close(descriptor)
             raise
 
 
-def _check_directory_privacy(directory: str) -> None:
+class _ServiceConsoleHandler(logging.StreamHandler):
+    """Identify console handlers owned by this service for clean reconfiguration."""
+
+    _tunnel_switch = True
+
+
+def _check_directory_privacy(directory: str | Path) -> None:
     """Refuse a log directory that other users can rename files within.
 
     A group- or world-writable directory would let another user replace the
     validated log path between configuration and open. The sticky bit (as in
     /tmp) already prevents that replacement, so such directories are allowed.
     """
-    mode = os.stat(directory).st_mode
+    mode = Path(directory).stat().st_mode
     if mode & 0o022 and not mode & 0o1000:
-        raise OSError(
-            f"log directory must not be group- or world-writable: {directory}"
-        )
+        message = f"log directory must not be group- or world-writable: {directory}"
+        raise OSError(message)
 
 
 def configure_logging(
-    settings: Logging, console: bool, console_level: int = logging.INFO
-):
+    settings: Logging,
+    console: bool,
+    console_level: int = logging.INFO,
+) -> Path | None:
     """Send timestamped records to the log file and, when console is true, stderr.
 
     ``console_level`` sets the least severe record the console handler emits,
@@ -88,12 +102,10 @@ def configure_logging(
             delay=True,
         )
         file_handler.setFormatter(formatter)
-        file_handler._tunnel_switch = True
         root.addHandler(file_handler)
     if console:
-        stream_handler = logging.StreamHandler()
+        stream_handler = _ServiceConsoleHandler()
         stream_handler.setLevel(console_level)
         stream_handler.setFormatter(formatter)
-        stream_handler._tunnel_switch = True
         root.addHandler(stream_handler)
     return settings.file

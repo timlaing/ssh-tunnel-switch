@@ -34,6 +34,12 @@ cooldown_seconds: 30
 startup_timeout_seconds: 15
 stop_timeout_seconds: 5
 start_on_launch: true
+# Recover from SSH exits/internet outages; intentional disconnects stay stopped.
+# Recovery attempts per outage (including the immediate attempt); 0 disables.
+reconnect_attempts: 5
+# First attempt is immediate; these delays apply only after recovery fails.
+reconnect_delay_seconds: 5
+reconnect_max_delay_seconds: 60
 # Defaults to this file under the service account's home directory.
 # Set null to disable persistence; relative paths are resolved beside this YAML.
 state_file: ~/.config/ssh-tunnel-switch/state.json

@@ -1,10 +1,17 @@
-from contextlib import asynccontextmanager
+"""Expose authenticated tunnel control and configuration reload over HTTP."""
+
 import asyncio
 import logging
 import secrets
 import signal
-from typing import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from pathlib import Path
+from typing import Annotated
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from starlette.requests import ClientDisconnect
+
 from . import __version__
 from .config import Config
 from .counters import RequestCounter
@@ -15,7 +22,13 @@ from .tunnel import RotationRejected, TunnelFailure, TunnelManager
 logger = logging.getLogger(__name__)
 
 
-def _build_reloader(app, config, config_path, on_reload, prepare, manager):
+def _build_reloader(
+    app: FastAPI,
+    config: Config,
+    config_path: Path | None,
+    on_reload: Sequence[Callable[[ReloadOutcome], None]],
+    prepare: Callable[[Config], None] | None,
+) -> ConfigReloader | None:
     """Create the reloader, or None when the service was given no YAML file.
 
     ``app.state`` is one of the reload targets, so the app must exist first;
@@ -23,6 +36,7 @@ def _build_reloader(app, config, config_path, on_reload, prepare, manager):
     """
     if config_path is None:
         return None
+    manager: TunnelManager = app.state.manager
     return ConfigReloader(
         config_path,
         config,
@@ -33,7 +47,12 @@ def _build_reloader(app, config, config_path, on_reload, prepare, manager):
     )
 
 
-def _start_reload(app, loop, stop, watch):
+def _start_reload(
+    app: FastAPI,
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    watch: bool,
+) -> asyncio.Task[None] | None:
     """Start the config poller and the SIGHUP trigger; return the poll task."""
     reloader = app.state.reloader
     if reloader is None:
@@ -44,14 +63,20 @@ def _start_reload(app, loop, stop, watch):
     try:
         # A manual trigger for systemd's ExecReload, independent of polling.
         loop.add_signal_handler(
-            signal.SIGHUP, lambda: asyncio.create_task(reloader.reload_now())
+            signal.SIGHUP,
+            lambda: asyncio.create_task(reloader.reload_now()),
         )
     except (RuntimeError, ValueError) as exc:
         logger.debug("SIGHUP reload trigger unavailable: %s", exc)
     return poller
 
 
-async def _stop_reload(app, loop, stop, poller):
+async def _stop_reload(
+    app: FastAPI,
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    poller: asyncio.Task[None] | None,
+) -> None:
     if app.state.reloader is not None:
         loop.remove_signal_handler(signal.SIGHUP)
     if poller is not None:
@@ -59,24 +84,42 @@ async def _stop_reload(app, loop, stop, poller):
         await poller
 
 
-async def _close(proxy, manager):
+async def _close(proxy: HTTPProxyServer, manager: TunnelManager) -> None:
     try:
         await proxy.close()
     finally:
         await manager.close()
 
 
-def _lifespan(config, manager, proxy, watch):
+def _lifespan(
+    config: Config,
+    manager: TunnelManager,
+    proxy: HTTPProxyServer,
+    *,
+    watch: bool,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     @asynccontextmanager
-    async def lifespan(app):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         loop = asyncio.get_running_loop()
         app.state.loop = loop
         stop = asyncio.Event()
-        poller = _start_reload(app, loop, stop, watch)
+        poller = _start_reload(app, loop, stop, watch=watch)
         try:
             if config.start_on_launch:
-                await manager.rotate()
+                try:
+                    await manager.rotate()
+                except TunnelFailure:
+                    if manager.config.reconnect_attempts == 0:
+                        raise
+                    logger.warning(
+                        "Initial tunnel connection failed; "
+                        "automatic recovery will retry",
+                    )
             await proxy.start()
+            reloader = app.state.reloader
+            manager.start_monitor(
+                reloader.apply_pending_binds if reloader is not None else None,
+            )
             yield
         finally:
             try:
@@ -87,19 +130,27 @@ def _lifespan(config, manager, proxy, watch):
     return lifespan
 
 
-def _authorizer(app, token):
-    def authorize(authorization: str | None = Header(default=None)):
+def _authorizer(app: FastAPI, token: str) -> Callable[..., None]:
+    def authorize(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> None:
         # The current token is read per request so a reload can rotate it.
         expected = f"Bearer {app.state.config.api.token or token}".encode()
         if authorization is None or not secrets.compare_digest(
-            authorization.encode(), expected
+            authorization.encode(),
+            expected,
         ):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
     return authorize
 
 
-def _reload_status(app, config_path, watch):
+def _reload_status(
+    app: FastAPI,
+    config_path: Path | None,
+    *,
+    watch: bool,
+) -> dict[str, bool | str | list[str] | None]:
     reloader = app.state.reloader
     return {
         "watching": reloader is not None and watch,
@@ -111,7 +162,7 @@ def _reload_status(app, config_path, watch):
 
 
 def _rotation_in_progress() -> HTTPException:
-    """The 429 a reload hits whenever a rotation owns the manager."""
+    """Build the retry response for a reload rejected during rotation."""
     return HTTPException(
         status_code=429,
         detail="Tunnel rotation already in progress",
@@ -119,9 +170,26 @@ def _rotation_in_progress() -> HTTPException:
     )
 
 
-def _register_routes(app, manager, authorize, config_path, watch):
+async def _request_reason(request: Request) -> str | None:
+    """Read an optional rotation reason without requiring a JSON body."""
+    try:
+        body = await request.json()
+        reason = body.get("reason") if isinstance(body, dict) else None
+        return reason if isinstance(reason, str) else None
+    except (ValueError, RuntimeError, ClientDisconnect):
+        return None
+
+
+def _register_routes(
+    app: FastAPI,
+    manager: TunnelManager,
+    authorize: Callable[..., None],
+    config_path: Path | None,
+    *,
+    watch: bool,
+) -> None:
     @app.get("/status", dependencies=[Depends(authorize)])
-    async def status():
+    async def status() -> dict[str, object]:
         current = app.state.config
         return {
             **manager.status(),
@@ -133,7 +201,7 @@ def _register_routes(app, manager, authorize, config_path, watch):
                 "ip": str(current.http_proxy.ip),
                 "port": current.http_proxy.port,
             },
-            "config_reload": _reload_status(app, config_path, watch),
+            "config_reload": _reload_status(app, config_path, watch=watch),
         }
 
     @app.post(
@@ -144,19 +212,13 @@ def _register_routes(app, manager, authorize, config_path, watch):
             503: {"description": "SSH tunnel could not be established"},
         },
     )
-    async def rotate(request: Request):
+    async def rotate(request: Request) -> dict[str, object]:
         reloader = app.state.reloader
         # A rotation creates a fresh ssh process, so a deferred SOCKS bind
         # becomes live there — but only once the rotation is admitted: a
         # rejected request must leave the still-running bind untouched.
         pending = reloader.apply_pending_binds if reloader is not None else None
-        # Read optional reason from request body
-        reason = None
-        try:
-            body = await request.json()
-            reason = body.get("reason") if isinstance(body, dict) else None
-        except Exception:
-            pass
+        reason = await _request_reason(request)
         try:
             return await manager.rotate(pending, reason=reason)
         except RotationRejected as exc:
@@ -173,16 +235,17 @@ def _register_routes(app, manager, authorize, config_path, watch):
         dependencies=[Depends(authorize)],
         responses={
             404: {
-                "description": "The service was started without a configuration file"
+                "description": "The service was started without a configuration file",
             },
             429: {"description": "Rotation already running or cooling down"},
         },
     )
-    async def reload():
+    async def reload() -> dict[str, bool | str | list[str] | int | None]:
         reloader = app.state.reloader
         if reloader is None:
             raise HTTPException(
-                status_code=404, detail="No configuration file was given to the service"
+                status_code=404,
+                detail="No configuration file was given to the service",
             )
         if manager.busy:
             raise _rotation_in_progress()
@@ -199,29 +262,42 @@ def create_app(
     token: str,
     manager: TunnelManager | None = None,
     *,
-    config_path=None,
+    config_path: Path | None = None,
     watch: bool = True,
     on_reload: Sequence[Callable[[ReloadOutcome], None]] = (),
     prepare: Callable[[Config], None] | None = None,
     counter: RequestCounter | None = None,
 ) -> FastAPI:
+    """Create the authenticated API with shared tunnel, proxy and reload state.
+
+    Optional keyword arguments configure the YAML path, polling, reload hooks,
+    per-run overrides and a request counter. A supplied manager owns its counter.
+    """
     if not token:
-        raise ValueError("API token must not be empty")
+        message = "API token must not be empty"
+        raise ValueError(message)
     if manager is not None and counter is not None:
-        raise ValueError(
+        message = (
             "Pass either a manager or a counter, not both: the proxy records "
             "into the counter of the manager it serves, so a separate "
             "counter would never see the requests"
         )
+        raise ValueError(message)
     manager = manager or TunnelManager(config, counter=counter)
     # The proxy records into the manager's counter, so one total backs both the
     # status panel and GET /status no matter which of the two was built here,
     # and it asks the manager whether an adopted tunnel is running before it
     # counts, so traffic on the SOCKS port while no tunnel is ours does not
     # enter the totals.
-    proxy = HTTPProxyServer(config, counter=manager.counter, active=manager.adopted)
+    proxy = HTTPProxyServer(
+        config,
+        counter=manager.counter,
+        active=manager.adopted,
+        connection_id=manager.connection_id,
+    )
     app = FastAPI(
-        title="Tunnel Switch", lifespan=_lifespan(config, manager, proxy, watch)
+        title="Tunnel Switch",
+        lifespan=_lifespan(config, manager, proxy, watch=watch),
     )
     app.state.manager = manager
     app.state.http_proxy = proxy
@@ -230,7 +306,17 @@ def create_app(
     # Every reload swaps the config attribute of these objects, so the API, the
     # tunnel manager and the HTTP bridge switch configuration as one reference.
     app.state.reloader = _build_reloader(
-        app, config, config_path, on_reload, prepare, manager
+        app,
+        config,
+        config_path,
+        on_reload,
+        prepare,
     )
-    _register_routes(app, manager, _authorizer(app, token), config_path, watch)
+    _register_routes(
+        app,
+        manager,
+        _authorizer(app, token),
+        config_path,
+        watch=watch,
+    )
     return app

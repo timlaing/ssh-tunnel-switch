@@ -37,9 +37,6 @@ include = ["/src", "/scripts", "/requirements-ci.txt", "/tests", "/examples", "/
 [tool.ruff]
 target-version = "py312"
 
-[tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
-
 [tool.coverage.run]
 relative_files = true
 source = ["tunnel_switch", "scripts"]

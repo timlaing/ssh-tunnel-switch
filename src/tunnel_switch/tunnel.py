@@ -1,12 +1,18 @@
+"""Manage SSH tunnel lifecycles, server selection, and automatic recovery."""
+
 import asyncio
-import re
-from collections.abc import Callable
-from datetime import datetime, timezone
 import logging
+import re
 import socket
 import time
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from datetime import UTC, datetime
+from functools import partial
+from ipaddress import IPv6Address
 from threading import Lock
 from uuid import uuid4
+
 from .config import Config, Server
 from .counters import RequestCounter
 from .state import load_last_server, save_last_server
@@ -14,39 +20,50 @@ from .state import load_last_server, save_last_server
 logger = logging.getLogger(__name__)
 
 
-class RotationRejected(Exception):
-    def __init__(self, message: str, retry_after: int = 1):
+class RotationRejectedError(Exception):
+    """Reject a concurrent or cooldown-limited tunnel change."""
+
+    def __init__(self, message: str, retry_after: int = 1) -> None:
+        """Store the admission failure and suggested retry interval."""
         super().__init__(message)
         self.retry_after = retry_after
 
 
-class TunnelFailure(Exception):
-    pass
+class TunnelFailureError(Exception):
+    """Report an SSH connection, readiness, or state persistence failure."""
 
 
-def _running(process) -> bool:
+# Keep the established exception imports and catch sites compatible.
+RotationRejected = RotationRejectedError
+TunnelFailure = TunnelFailureError
+
+
+def _running(process: asyncio.subprocess.Process | None) -> bool:
     """Whether an SSH process was started and has not exited yet."""
     return process is not None and process.returncode is None
 
 
 class TunnelManager:
-    def __init__(self, config: Config, counter: RequestCounter | None = None):
+    """Own one SSH process and publish coherent connection status snapshots."""
+
+    def __init__(self, config: Config, counter: RequestCounter | None = None) -> None:
+        """Initialize an idle manager with the configured or remembered selection."""
         self.config = config
         # Shared with the HTTP proxy, which records into it while status()
         # reports it: the request totals belong to the connection lifecycle
         # this class owns, so they are read from here.
         self.counter = counter or RequestCounter()
-        self.process = None
+        self.process: asyncio.subprocess.Process | None = None
         # (connection_id, started_at, server_name) published as one immutable
         # snapshot: the status display thread reads it while rotate()/_stop()
         # write, so a torn read would mix values from different lifecycles.
-        self._connection = None
+        self._connection: tuple[str, datetime, str | None] | None = None
         # Guards everything status() reports against the writes that publish a
         # connection, so one status() call describes one instant instead of
         # straddling a rotation: the display thread and the service loop share
         # it, and it is never held across an await.
         self._state_lock = Lock()
-        self.last_error = None
+        self.last_error: str | None = None
         remembered = next(
             (
                 index
@@ -61,13 +78,22 @@ class TunnelManager:
         # resumes the saved server, then subsequent rotations advance normally.
         self._index = remembered - 1 if remembered is not None else -1
         self._busy = False
-        self._last_rotation = None
+        self._last_rotation: float | None = None
         # False until the first connection attempt: before that, "the current
         # server" is the one a rotation would pick, not one we have tried.
         self._attempted = False
+        # Desired state is separate from process liveness: an exited SSH should
+        # recover, but an intentional disconnect (or idle launch) should not.
+        self._want_connection = False
+        # Manual changes invalidate any retry deadline/backoff the monitor held.
+        self._generation = 0
+        self._reconnect_server: tuple[str | None, str] | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._reported_exit: asyncio.subprocess.Process | None = None
 
     @property
     def busy(self) -> bool:
+        """Return whether a tunnel change currently holds the admission gate."""
         return self._busy
 
     def adopted(self) -> bool:
@@ -77,10 +103,16 @@ class TunnelManager:
         tunnel serves the SOCKS port, whatever answers on it belongs to some
         other listener, and its requests are not this tunnel's to count.
         """
-        with self._state_lock:
-            return _running(self.process) and self._connection is not None
+        return self.connection_id() is not None
 
-    def _admit(self, cooldown: bool = True) -> None:
+    def connection_id(self) -> str | None:
+        """Return the live adopted generation, refusing admission during changes."""
+        with self._state_lock:
+            if self._busy or not _running(self.process) or self._connection is None:
+                return None
+            return self._connection[0]
+
+    def _admit(self, *, cooldown: bool = True) -> None:
         """Refuse a connection change while one runs or the cooldown holds.
 
         ``cooldown=False`` keeps the busy gate but skips the backoff: an
@@ -88,18 +120,19 @@ class TunnelManager:
         panel, so it must not be refused for having just rotated.
         """
         if self._busy:
-            raise RotationRejected("Tunnel rotation already in progress")
+            message = "Tunnel rotation already in progress"
+            raise RotationRejected(message)
         if not cooldown:
             return
         now = time.monotonic()
         if self._last_rotation is not None:
             remaining = self.config.cooldown_seconds - (now - self._last_rotation)
             if remaining > 0:
-                raise RotationRejected(
-                    "Tunnel rotation cooldown active", int(remaining) + 1
-                )
+                message = "Tunnel rotation cooldown active"
+                raise RotationRejected(message, int(remaining) + 1)
 
-    def status(self) -> dict:
+    def status(self) -> dict[str, object]:
+        """Snapshot connection identity, liveness, request totals, and errors."""
         # One lock-guarded read: the liveness check, the connection snapshot
         # and the counter snapshot describe the same instant, so ssh exiting
         # or a rotation publishing a new connection cannot leave the totals
@@ -129,6 +162,7 @@ class TunnelManager:
         }
 
     def command(self, server: Server) -> list[str]:
+        """Build noninteractive SSH arguments with strict host-key verification."""
         ip = str(self.config.proxy.ip)
         bind = f"[{ip}]" if ":" in ip else ip
         args = [
@@ -162,37 +196,32 @@ class TunnelManager:
             args.extend(["-i", str(server.identity_file)])
         return [*args, "--", server.host]
 
-    async def _stop(self):
+    async def _stop(self) -> None:
         process = self.process
         if process is None:
             return
         if process.returncode is None:
-            try:
+            with suppress(ProcessLookupError):
                 process.terminate()
-            except ProcessLookupError:
-                pass
             try:
                 await asyncio.wait_for(process.wait(), self.config.stop_timeout_seconds)
             except TimeoutError:
-                try:
+                with suppress(ProcessLookupError):
                     process.kill()
-                except ProcessLookupError:
-                    pass
                 await process.wait()
         with self._state_lock:
             self.process = None
             self._connection = None
 
-    async def _ready(self):
+    async def _ready(self) -> bool:
         ip = str(self.config.proxy.ip)
-        if ip == "0.0.0.0":
-            ip = "127.0.0.1"
-        elif ip == "::":
-            ip = "::1"
+        if self.config.proxy.ip.is_unspecified:
+            ip = "::1" if isinstance(self.config.proxy.ip, IPv6Address) else "127.0.0.1"
         writer = None
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, self.config.proxy.port), 0.5
+                asyncio.open_connection(ip, self.config.proxy.port),
+                0.5,
             )
             writer.write(b"\x05\x01\x00")
             await writer.drain()
@@ -204,18 +233,19 @@ class TunnelManager:
                 writer.close()
                 await writer.wait_closed()
 
-    def _ensure_socket_free(self):
+    def _ensure_socket_free(self) -> None:
         family = (
-            socket.AF_INET6 if self.config.proxy.ip.version == 6 else socket.AF_INET
+            socket.AF_INET6
+            if isinstance(self.config.proxy.ip, IPv6Address)
+            else socket.AF_INET
         )
         with socket.socket(family) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((str(self.config.proxy.ip), self.config.proxy.port))
             except OSError as exc:
-                raise TunnelFailure(
-                    "SOCKS bind address is already occupied or unavailable"
-                ) from exc
+                message = "SOCKS bind address is already occupied or unavailable"
+                raise TunnelFailure(message) from exc
 
     async def rotate(
         self,
@@ -223,7 +253,7 @@ class TunnelManager:
         *,
         ignore_cooldown: bool = False,
         reason: str | None = None,
-    ) -> dict:
+    ) -> dict[str, object]:
         """Connect through the next server, falling back to the rest of the list.
 
         ``pre_connect`` runs once the rotation is admitted and before the
@@ -246,27 +276,33 @@ class TunnelManager:
         self,
         name: str,
         pre_connect: Callable[[], None] | None = None,
-    ) -> dict:
+    ) -> dict[str, object]:
         """Connect through one named server, without trying the others.
 
         An explicit choice skips the cooldown for the same reason as
         ``ignore_cooldown`` on rotate(): the operator picked that server, so
-        it either comes up or its failure is reported. No failover runs —
-        connecting elsewhere would not be the selection that was asked for.
+        it either comes up or its failure is reported. This immediate selection
+        never fails over. If automatic recovery is enabled, subsequent recovery
+        attempts may fail over after retrying the selected server.
         """
         servers = self.config.servers
         server = next((s for s in servers if s.name == name), None)
         if server is None:
-            raise ValueError(
+            message = (
                 f"Unknown server: {name}. Choose one of: "
                 f"{', '.join(s.name for s in servers)}"
             )
+            raise ValueError(message)
         self._admit(cooldown=False)
         return await self._change(
-            lambda: self._connect_selected(servers.index(server)), pre_connect
+            lambda: self._connect_selected(servers.index(server)),
+            pre_connect,
         )
 
-    async def restart(self, pre_connect: Callable[[], None] | None = None) -> dict:
+    async def restart(
+        self,
+        pre_connect: Callable[[], None] | None = None,
+    ) -> dict[str, object]:
         """Reconnect to the server the rotation index currently names.
 
         The index is pinned instead of advanced, so a restart bounces the
@@ -278,10 +314,11 @@ class TunnelManager:
         self._admit()
         first = self._index if self._attempted else None
         return await self._change(
-            lambda: self._rotate_across_servers(first_index=first), pre_connect
+            lambda: self._rotate_across_servers(first_index=first),
+            pre_connect,
         )
 
-    async def disconnect(self) -> dict:
+    async def disconnect(self) -> dict[str, object]:
         """Stop the tunnel without connecting elsewhere.
 
         Stopping never contacts an SSH server, so it also clears the cooldown
@@ -290,8 +327,11 @@ class TunnelManager:
         admitted while the old connection is still shutting down.
         """
         if self._busy:
-            raise RotationRejected("Tunnel rotation already in progress")
+            message = "Tunnel rotation already in progress"
+            raise RotationRejected(message)
         self._busy = True
+        self._want_connection = False
+        self._generation += 1
         try:
             await self._stop()
         finally:
@@ -301,9 +341,17 @@ class TunnelManager:
         return self.status()
 
     async def _change(
-        self, connect, pre_connect: Callable[[], None] | None = None
-    ) -> dict:
+        self,
+        connect: Callable[[], Awaitable[None]],
+        pre_connect: Callable[[], None] | None = None,
+        *,
+        recovery: bool = False,
+    ) -> dict[str, object]:
         self._busy = True
+        if not recovery:
+            self._want_connection = True
+            self._generation += 1
+            self._reconnect_server = None
         self.last_error = None
         try:
             if pre_connect is not None:
@@ -345,12 +393,14 @@ class TunnelManager:
                     failures.append((server.name, exc))
                     if attempt + 1 < len(servers):
                         logger.exception(
-                            "Tunnel rotation to server %s failed; trying the next server",
+                            "Tunnel rotation to server %s failed; "
+                            "trying the next server",
                             server.name,
                         )
                     else:
                         logger.exception(
-                            "Tunnel rotation to server %s failed", server.name
+                            "Tunnel rotation to server %s failed",
+                            server.name,
                         )
                     await self._stop()
                     continue
@@ -398,7 +448,7 @@ class TunnelManager:
         with self._state_lock:
             self._connection = (
                 str(uuid4()),
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 server.name,
             )
             # The new connection owns the request totals from here on: the
@@ -408,6 +458,9 @@ class TunnelManager:
         # move on to another server, since the same state file would fail.
         try:
             await self._remember_server(server)
+        except asyncio.CancelledError:
+            await self._stop()
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             logger.exception(
@@ -417,8 +470,10 @@ class TunnelManager:
             await self._stop()
             raise TunnelFailure(str(exc)) from exc
         logger.info("Tunnel connected to SSH server %s (%s)", server.name, server.host)
+        self._reconnect_server = (server.name, server.host)
+        self._reported_exit = None
 
-    async def _connect(self, server: Server):
+    async def _connect(self, server: Server) -> None:
         """Start SSH for *server* and wait until it proxies, or raise."""
         await self._stop()
         self._ensure_socket_free()
@@ -432,7 +487,7 @@ class TunnelManager:
             self.process = process
         await self._wait_until_ready()
 
-    async def _wait_until_ready(self):
+    async def _wait_until_ready(self) -> None:
         """Wait for SOCKS readiness and a stable SSH process within its deadline.
 
         An SSH connection failure (auth, host key, unreachable host) makes ssh
@@ -450,26 +505,187 @@ class TunnelManager:
             await asyncio.sleep(0.1)
         # ssh may have died just as the deadline passed; report the real cause.
         self._raise_if_ssh_exited()
-        raise TunnelFailure("SSH SOCKS startup timed out")
+        message = "SSH SOCKS startup timed out"
+        raise TunnelFailure(message)
 
-    def _raise_if_ssh_exited(self):
+    def _raise_if_ssh_exited(self) -> None:
         if self.process.returncode is not None:
-            raise TunnelFailure(
-                f"SSH exited with code {self.process.returncode}; check authentication, known_hosts and forwarding permissions"
+            message = (
+                f"SSH exited with code {self.process.returncode}; "
+                "check authentication, known_hosts and forwarding permissions"
             )
+            raise TunnelFailure(message)
 
-    async def _remember_server(self, server):
+    async def _remember_server(self, server: Server) -> None:
         """Finish atomic persistence before allowing any subsequent rotation."""
         if self.config.state_file is None:
             return
         save = asyncio.create_task(
-            asyncio.to_thread(save_last_server, self.config.state_file, server)
+            asyncio.to_thread(save_last_server, self.config.state_file, server),
         )
         try:
             await asyncio.shield(save)
-        except asyncio.CancelledError:
-            await save
+        except asyncio.CancelledError as cancelled:
+            try:
+                await save
+            except Exception as exc:
+                logger.exception("Tunnel state save failed during cancellation")
+                raise cancelled from exc
             raise
 
-    async def close(self):
-        await self._stop()
+    def start_monitor(
+        self,
+        pre_connect: Callable[[], None] | None = None,
+        *,
+        interval: float = 1.0,
+    ) -> None:
+        """Watch SSH exits until close(), including while auto recovery is disabled."""
+        if self._monitor_task is None:
+            self._monitor_task = asyncio.create_task(
+                self._monitor(pre_connect, interval),
+            )
+
+    async def _monitor(
+        self,
+        pre_connect: Callable[[], None] | None,
+        interval: float,
+    ) -> None:
+        generation = None
+        retry_at = None
+        attempts = 0
+        while True:
+            await asyncio.sleep(interval)
+            if generation != self._generation:
+                generation = self._generation
+                retry_at = None
+                attempts = 0
+            if self._busy:
+                continue
+            self._observe_ssh_exit()
+            if not self._needs_recovery():
+                retry_at = None
+                attempts = 0
+                continue
+            if attempts >= self.config.reconnect_attempts:
+                continue
+            if retry_at is None:
+                logger.warning("Tunnel disconnected; reconnecting immediately")
+            elif time.monotonic() < retry_at:
+                continue
+            self._admit(cooldown=False)
+            attempts += 1
+            try:
+                await self._recover(pre_connect)
+            except Exception as exc:
+                logger.debug("Tunnel recovery attempt failed", exc_info=True)
+                self.last_error = str(exc)
+                delay = self._retry_delay(attempts)
+                retry_at = time.monotonic() + delay
+                self._report_recovery_failure(attempts, delay, exc)
+            else:
+                retry_at = None
+                attempts = 0
+
+    def _retry_delay(self, failures: int) -> float:
+        """Calculate the next wait from current settings without overflowing."""
+        cap = self.config.reconnect_max_delay_seconds
+        delay = min(self.config.reconnect_delay_seconds, cap)
+        for _ in range(failures - 1):
+            if delay >= cap:
+                return cap
+            delay = min(delay * 2, cap)
+        return delay
+
+    def _needs_recovery(self) -> bool:
+        return (
+            self._want_connection
+            and self.config.reconnect_attempts > 0
+            and not self.adopted()
+        )
+
+    def _observe_ssh_exit(self) -> None:
+        """Report each adopted process exit once, even with recovery disabled."""
+        process = self.process
+        if (
+            process is None
+            or process.returncode is None
+            or self._connection is None
+            or process is self._reported_exit
+        ):
+            return
+        self._reported_exit = process
+        self.last_error = f"SSH tunnel exited with code {process.returncode}"
+        logger.warning("%s", self.last_error)
+
+    async def _recover(self, pre_connect: Callable[[], None] | None) -> None:
+        # Resolve by identity, not the old list index: a reload may have
+        # reordered or removed the previously connected server.
+        first = next(
+            (
+                i
+                for i, server in enumerate(self.config.servers)
+                if (server.name, server.host) == self._reconnect_server
+            ),
+            self._index % len(self.config.servers),
+        )
+        await self._change(
+            partial(self._rotate_across_servers, first_index=first),
+            pre_connect,
+            recovery=True,
+        )
+
+    def _report_recovery_failure(
+        self,
+        attempts: int,
+        delay: float,
+        exc: Exception,
+    ) -> None:
+        if attempts >= self.config.reconnect_attempts:
+            logger.warning(
+                "Tunnel reconnection failed; exhausted %d recovery attempts: %s",
+                attempts,
+                exc,
+            )
+        else:
+            logger.warning(
+                "Tunnel reconnection failed; retrying in %.1f seconds: %s",
+                delay,
+                exc,
+            )
+
+    async def close(self) -> None:
+        """Cancel exit monitoring and stop SSH, preserving caller cancellation."""
+        self._want_connection = False
+        self._generation += 1
+        task, self._monitor_task = self._monitor_task, None
+        try:
+            if task is not None:
+                task.cancel()
+                try:
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=self.config.stop_timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    task.cancel()
+                    task.add_done_callback(self._report_late_monitor_error)
+                    raise
+                if not done:
+                    logger.warning("Tunnel monitor did not stop in time; stopping SSH")
+                    task.add_done_callback(self._report_late_monitor_error)
+                elif not task.cancelled():
+                    task.result()
+        finally:
+            await self._stop()
+
+    @staticmethod
+    def _report_late_monitor_error(task: asyncio.Task[None]) -> None:
+        """Collect failures from a monitor that outlives its shutdown deadline."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Tunnel monitor failed after shutdown",
+                exc_info=(type(error), error, error.__traceback__),
+            )

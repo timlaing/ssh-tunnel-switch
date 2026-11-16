@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Automatically reconnect failed SSH tunnels immediately on detection, trying the current server before failover with configurable exponential backoff after failures. Default to 5 recovery attempts per outage; `reconnect_attempts: 0` disables recovery. Keep the API available during startup outages; respect intentional disconnects and cancel recovery on shutdown.
+
 ## 1.5.0 — 2026-11-02
 
 - Log the rotation reason from the API request: the `/rotate` endpoint now accepts an optional `reason` field in the JSON body, and `TunnelManager.rotate()` logs the reason at INFO level. The change is backward compatible — no reason is logged when omitted.
