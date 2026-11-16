@@ -229,6 +229,83 @@ async def test_reload_with_unchanged_content_is_not_applied(yaml_file: Path) -> 
     await manager.close()
 
 
+@pytest.mark.parametrize("failure_kind", ["yaml", "validation", "io"])
+async def test_expected_reload_failures_log_one_warning_without_traceback(
+    yaml_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+) -> None:
+    """Routine reload errors retain configuration without duplicate noisy logs."""
+    cfg = load_config(yaml_file)
+    manager = TunnelManager(cfg)
+    outcomes = []
+    reloader = ConfigReloader(
+        yaml_file,
+        cfg,
+        targets=[manager],
+        hooks=[outcomes.append],
+    )
+    if failure_kind == "yaml":
+        yaml_file.write_text("servers: [\n")
+    elif failure_kind == "validation":
+        yaml_file.write_text(document(servers=[]))
+    else:
+        yaml_file.unlink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="tunnel_switch.reload"):
+            outcome = await reloader.reload_now()
+        records = [
+            record for record in caplog.records if record.name == "tunnel_switch.reload"
+        ]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert records[0].exc_info is None
+        assert outcome.error
+        assert not outcome.applied
+        assert manager.config is cfg
+        assert reloader.last_error == outcome.error
+        assert outcomes == [outcome]
+    finally:
+        await manager.close()
+
+
+async def test_unexpected_reload_failure_logs_one_traceback_and_retains_config(
+    yaml_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unexpected loader bugs keep their traceback without a second warning."""
+    cfg = load_config(yaml_file)
+    manager = TunnelManager(cfg)
+    outcomes = []
+    reloader = ConfigReloader(
+        yaml_file,
+        cfg,
+        targets=[manager],
+        hooks=[outcomes.append],
+    )
+
+    def fail(_path: Path) -> Config:
+        raise RuntimeError("Unexpected loader failure")
+
+    monkeypatch.setattr(reload_module, "load_config", fail)
+    try:
+        with caplog.at_level(logging.WARNING, logger="tunnel_switch.reload"):
+            outcome = await reloader.reload_now()
+        records = [
+            record for record in caplog.records if record.name == "tunnel_switch.reload"
+        ]
+        assert len(records) == 1
+        assert records[0].levelno == logging.ERROR
+        assert records[0].exc_info[0] is RuntimeError
+        assert outcome.error == "Unexpected loader failure"
+        assert not outcome.applied
+        assert manager.config is cfg
+        assert outcomes == [outcome]
+    finally:
+        await manager.close()
+
+
 async def test_pending_bind_is_adopted_by_the_next_connection_change(
     yaml_file: Path,
 ) -> None:

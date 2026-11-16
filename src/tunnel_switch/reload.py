@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from yaml import YAMLError
+
 from .config import API, Config, HTTPProxy, Proxy, load_config
 
 logger = logging.getLogger(__name__)
@@ -198,14 +200,18 @@ class ConfigReloader:
         except Exception as exc:
             # Reload is a recovery boundary: even unexpected loader failures
             # must retain the last working configuration and reach the panel.
-            logger.exception("Configuration loader failed during reload")
+            if isinstance(exc, (ValueError, OSError, YAMLError)):
+                logger.warning(
+                    "Configuration reload failed; keeping the running configuration: %s",
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "Unexpected configuration reload failure; keeping the running configuration",
+                )
             self.last_error = str(exc)
             self.last_reload = f"{self._stamp()} failed: {exc}"
             outcome = ReloadOutcome(error=str(exc), config=self.config)
-            logger.warning(
-                "Configuration reload failed; keeping the running configuration: %s",
-                exc,
-            )
             self._notify(outcome)
             return outcome
         if self.busy is not None and self.busy():
