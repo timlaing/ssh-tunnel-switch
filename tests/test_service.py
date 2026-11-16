@@ -611,6 +611,33 @@ async def test_rotate_with_reason_logs_and_returns_200(manager, caplog):
     await manager.close()
 
 
+@pytest.mark.parametrize(
+    "reason", [None, 5, ["x"], {"detail": "x"}, True, False, 0, [], {}]
+)
+async def test_rotate_ignores_non_string_reasons(manager, caplog, reason):
+    """Invalid optional reasons must not fail rotation or reach its reason log."""
+    caplog.set_level(logging.INFO)
+    application = create_app(manager.config, "secret", manager)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/rotate",
+                headers={"Authorization": "Bearer secret"},
+                json={"reason": reason},
+            )
+        assert response.status_code == 200
+        assert response.json()["state"] == "connected"
+        assert not any(
+            "Tunnel rotation requested" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        await manager.close()
+
+
 async def test_rotate_rejected_before_logging(manager, caplog):
     """When rotation is rejected (busy/cooldown), the reason should NOT be logged."""
     import os
@@ -1953,6 +1980,78 @@ async def test_close_reports_unexpected_monitor_failure_after_cleanup(manager):
         await manager.close()
     assert process.terminated
     assert manager.process is None
+
+
+async def test_close_stops_ssh_when_recovery_state_save_stalls(
+    manager,
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    """A stalled filesystem must not prevent the manager from stopping SSH."""
+    await manager.rotate()
+    entered, release = threading.Event(), threading.Event()
+    manager.config.state_file = tmp_path / "state.json"
+    manager.config.stop_timeout_seconds = 0.03
+
+    def stalled_save(path, server):
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Test did not release the state save")
+        save_last_server(path, server)
+
+    monkeypatch.setattr("tunnel_switch.tunnel.save_last_server", stalled_save)
+    start_recovery(manager)
+    monitor = manager._monitor_task
+    manager.process.returncode = 255
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        process = manager.process
+        await asyncio.wait_for(manager.close(), 1)
+        assert not release.is_set()
+        assert not monitor.done()
+        assert process.terminated
+        assert manager.process is None
+        assert manager._monitor_task is None
+        assert "Tunnel monitor did not stop in time; stopping SSH" in caplog.text
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(monitor, return_exceptions=True), 2)
+        await manager.close()
+
+
+async def test_close_collects_late_monitor_failure(manager, caplog):
+    """Report failures after the bounded shutdown wait without leaking task errors."""
+    await manager.rotate()
+    process = manager.process
+    manager.config.stop_timeout_seconds = 0.03
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_failure():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError("Late monitor failure") from None
+
+    monitor = asyncio.create_task(delayed_failure())
+    manager._monitor_task = monitor
+    try:
+        await entered.wait()
+        await asyncio.wait_for(manager.close(), 1)
+        assert not monitor.done()
+        assert process.terminated
+        assert manager.process is None
+        release.set()
+        await asyncio.gather(monitor, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert "Tunnel monitor failed after shutdown" in caplog.text
+        assert "Late monitor failure" in caplog.text
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(monitor, return_exceptions=True), 2)
+        await manager.close()
 
 
 async def test_lifespan_keeps_api_up_after_initial_tunnel_failure(manager, monkeypatch):

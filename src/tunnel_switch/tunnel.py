@@ -661,10 +661,31 @@ class TunnelManager:
         try:
             if task is not None:
                 task.cancel()
-                # Collect the child's expected cancellation, but cancellation
-                # of close() itself must propagate after the final SSH cleanup.
-                (outcome,) = await asyncio.gather(task, return_exceptions=True)
-                if isinstance(outcome, Exception):
-                    raise outcome
+                try:
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=self.config.stop_timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    task.cancel()
+                    task.add_done_callback(self._report_late_monitor_error)
+                    raise
+                if not done:
+                    logger.warning("Tunnel monitor did not stop in time; stopping SSH")
+                    task.add_done_callback(self._report_late_monitor_error)
+                elif not task.cancelled():
+                    task.result()
         finally:
             await self._stop()
+
+    @staticmethod
+    def _report_late_monitor_error(task: asyncio.Task[None]) -> None:
+        """Collect failures from a monitor that outlives its shutdown deadline."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Tunnel monitor failed after shutdown",
+                exc_info=(type(error), error, error.__traceback__),
+            )

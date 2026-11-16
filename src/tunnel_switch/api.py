@@ -170,11 +170,12 @@ def _rotation_in_progress() -> HTTPException:
     )
 
 
-async def _request_reason(request: Request) -> object:
+async def _request_reason(request: Request) -> str | None:
     """Read an optional rotation reason without requiring a JSON body."""
     try:
         body = await request.json()
-        return body.get("reason") if isinstance(body, dict) else None
+        reason = body.get("reason") if isinstance(body, dict) else None
+        return reason if isinstance(reason, str) else None
     except (ValueError, RuntimeError, ClientDisconnect):
         return None
 
