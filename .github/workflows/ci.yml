@@ -1,8 +1,8 @@
 name: CI
-'on':
+"on":
   push:
     branches:
-    - main
+      - main
   pull_request: null
   workflow_dispatch: null
 permissions:
@@ -19,152 +19,158 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: ubuntu-latest
-          python: '3.12'
-        - os: ubuntu-latest
-          python: '3.13'
-        - os: ubuntu-latest
-          python: '3.14'
-        - os: macos-latest
-          python: '3.13'
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.13"
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
-    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-      with:
-        python-version: ${{ matrix.python }}
-        cache: pip
-        cache-dependency-path: requirements-ci.txt
-    - name: Use Homebrew OpenSSL on macOS
-      if: runner.os == 'macOS'
-      run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
-    - name: Install test and packaging dependencies
-      run: 'python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt'
-    - name: Clean Python cache
-      run: find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-    - name: Test standalone service and proxy
-      env:
-        PYTHONDONTWRITEBYTECODE: '1'
-      run: |
-        PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml -k "not test_rotate_rejected_before_logging"
-    - name: Test rotate rejected logging (without coverage)
-      env:
-        PYTHONDONTWRITEBYTECODE: '1'
-      run: |
-        PYTHONPATH=src python -m pytest -q tests/test_service.py::test_rotate_rejected_before_logging
-    - name: Normalize Python coverage paths to repository root
-      run: |
-        python3 - <<'PY'
-        from pathlib import Path
-        import xml.etree.ElementTree as ET
-        tree = ET.parse('coverage.xml')
-        node = tree.getroot().find('sources')
-        sources = [Path(item.text) for item in node if item.text]
-        for item in tree.getroot().iter('class'):
-            path = Path(item.attrib['filename'])
-            choices = [path, *[source / path for source in sources]]
-            matches = [candidate for candidate in choices if candidate.is_file() and not candidate.is_absolute() and '..' not in candidate.parts]
-            if not matches:
-                raise ValueError(f'Cannot map coverage file: {path}')
-            item.set('filename', matches[0].as_posix())
-        node.clear()
-        ET.SubElement(node, 'source').text = '.'
-        tree.write('coverage.xml', encoding='utf-8', xml_declaration=True)
-        PY
-    - name: Record Python coverage revision
-      run: git rev-parse HEAD > coverage-revision.txt
-    - name: Upload Python coverage for SonarQube
-      if: runner.os == 'Linux' && matrix.python == '3.13'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-      with:
-        name: python-coverage
-        path: |
-          coverage.xml
-          coverage-revision.txt
-        if-no-files-found: error
-        retention-days: 7
-    - name: Build Python distribution
-      run: python -m build --no-isolation
-    - run: python -m twine check dist/*
-    - run: python scripts/verify-package.py
-    - name: Verify installed wheel and CLI
-      run: |
-        python -m venv /tmp/package-check
-        /tmp/package-check/bin/python -m pip install dist/*.whl
-        /tmp/package-check/bin/tunnel-switch --help
-        /tmp/package-check/bin/tunnel-switch validate --config examples/config.yaml
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Use Homebrew OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+      - name: Install test and packaging dependencies
+        run: "python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt"
+      - name: Clean Python cache
+        run: find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+      - name: Test standalone service and proxy
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          PYTHONPATH=src python -m pytest -q --cov=tunnel_switch --cov=scripts --cov-branch --cov-report=xml:coverage.xml -k "not test_rotate_rejected_before_logging"
+      - name: Test rotate rejected logging (without coverage)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          PYTHONPATH=src python -m pytest -q tests/test_service.py::test_rotate_rejected_before_logging
+      - name: Normalize Python coverage paths to repository root
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          node = tree.getroot().find('sources')
+          sources = [Path(item.text) for item in node if item.text]
+          for item in tree.getroot().iter('class'):
+              path = Path(item.attrib['filename'])
+              choices = [path, *[source / path for source in sources]]
+              matches = [candidate for candidate in choices if candidate.is_file() and not candidate.is_absolute() and '..' not in candidate.parts]
+              if not matches:
+                  raise ValueError(f'Cannot map coverage file: {path}')
+              item.set('filename', matches[0].as_posix())
+          node.clear()
+          ET.SubElement(node, 'source').text = '.'
+          tree.write('coverage.xml', encoding='utf-8', xml_declaration=True)
+          PY
+      - name: Record Python coverage revision
+        run: git rev-parse HEAD > coverage-revision.txt
+      - name: Upload Python coverage for SonarQube
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: python-coverage
+          path: |
+            coverage.xml
+            coverage-revision.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build Python distribution
+        run: python -m build --no-isolation
+      - run: python -m twine check dist/*
+      - run: python scripts/verify-package.py
+      - name: Verify installed wheel and CLI
+        run: |
+          python -m venv /tmp/package-check
+          /tmp/package-check/bin/python -m pip install dist/*.whl
+          /tmp/package-check/bin/tunnel-switch --help
+          /tmp/package-check/bin/tunnel-switch validate --config examples/config.yaml
   deployment:
     name: Deployment unit syntax
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-    - name: Verify systemd unit without starting a service
-      run: |
-        # The CLI is installed at deployment time; this executable placeholder
-        # lets verify check the unit's syntax and dependencies without running it.
-        sudo mkdir -p /opt/tunnel-switch/.venv/bin
-        sudo ln -s /usr/bin/true /opt/tunnel-switch/.venv/bin/tunnel-switch
-        systemd-analyze verify --man=no deploy/systemd/tunnel-switch.service
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify systemd unit without starting a service
+        run: |
+          # The CLI is installed at deployment time; this executable placeholder
+          # lets verify check the unit's syntax and dependencies without running it.
+          sudo mkdir -p /opt/tunnel-switch/.venv/bin
+          sudo ln -s /usr/bin/true /opt/tunnel-switch/.venv/bin/tunnel-switch
+          systemd-analyze verify --man=no deploy/systemd/tunnel-switch.service
   ssh:
     name: Real SSH integration
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-      with:
-        python-version: '3.13'
-        cache: pip
-        cache-dependency-path: requirements-ci.txt
-    - run: 'python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt'
-    - name: Test real OpenSSH startup, rotation, failures and cleanup
-      run: PYTHONPATH=src python -m pytest -q -m ssh_integration
-      env:
-        TUNNEL_SWITCH_TEST_SSH: '1'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: "python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt"
+      - name: Test real OpenSSH startup, rotation, failures and cleanup
+        run: PYTHONPATH=src python -m pytest -q -m ssh_integration
+        env:
+          TUNNEL_SWITCH_TEST_SSH: "1"
   lint:
     name: Python lint
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-      with:
-        python-version: '3.13'
-    - run: 'python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt'
-    - run: ruff check .
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - run: "python -m pip install --require-hashes --only-binary=:all: -r requirements-ci.txt"
+      - run: ruff check .
   validation-result:
     name: Validate ci
     needs:
-    - python
-    - deployment
-    - ssh
-    - lint
-    - workflow-tooling
+      - python
+      - deployment
+      - ssh
+      - lint
+      - workflow-tooling
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     steps:
-    - name: Require every validation job to pass
-      env:
-        RESULTS: ${{ toJSON(needs) }}
-      run: |
-        python3 -I - <<'PY'
-        import json, os
-        results = json.loads(os.environ['RESULTS'])
-        failed = [name for name, job in results.items() if job['result'] != 'success']
-        if failed:
-            raise SystemExit('Validation incomplete: ' + ', '.join(failed))
-        PY
+      - name: Require every validation job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in results.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('Validation incomplete: ' + ', '.join(failed))
+          PY
   workflow-tooling:
     name: Workflow tooling coverage
     runs-on: ubuntu-latest
@@ -172,26 +178,32 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        ref: ${{ github.event.pull_request.head.sha || github.sha }}
-        persist-credentials: false
-    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-      with:
-        python-version: '3.14'
-    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-      with:
-        node-version: '26'
-    - name: Measure policy and coordinator coverage
-      run: |
-        python3 -m pip install --only-binary=:all: PyYAML==6.0.3 coverage==7.11.0
-        mkdir -p coverage-workflow
-        python3 -m coverage run --branch --source=.github/scripts -m unittest discover -s .github/scripts
-        python3 -m coverage xml -o coverage-workflow/python.xml
-        node --test --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage-workflow/javascript.lcov .github/scripts/quality-review.test.cjs
-    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-      with:
-        name: workflow-tooling-coverage
-        path: coverage-workflow/
-        if-no-files-found: error
-        retention-days: 7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "26"
+      - name: Measure policy and coordinator coverage
+        run: |
+          python3 -m pip install --only-binary=:all: PyYAML==6.0.3 coverage==7.11.0
+          mkdir -p coverage-workflow
+          python3 -m coverage run --branch --source=.github/scripts -m unittest discover -s .github/scripts
+          python3 -m coverage xml -o coverage-workflow/python.xml
+          node --test --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage-workflow/javascript.lcov .github/scripts/quality-review.test.cjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: workflow-tooling-coverage
+          path: coverage-workflow/
+          if-no-files-found: error
+          retention-days: 7
