@@ -42,4 +42,4 @@ relative_files = true
 source = ["tunnel_switch", "scripts"]
 
 [dependency-groups]
-ci = ["build>=1,<2", "twine>=6,<8", "hatchling>=1.27,<2", "ruff==0.17.0", "pip-audit>=2,<3"]
+ci = ["build>=1,<2", "twine>=6,<8", "hatchling>=1.27,<2", "ruff==0.17.5", "pip-audit>=2,<3"]
